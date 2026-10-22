@@ -1,0 +1,42 @@
+From 5874478f9cf4869198c1dec9feb95c4aa123b1f2 Mon Sep 17 00:00:00 2001
+From: hubix94 <hubix94@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 17:06:22 +0200
+Subject: [PATCH 2/5] MIPS: PS2: IOP: Actually initialise the DEV9 expansion
+ bay
+
+iop_dev9_init() returns right after iop_module_request("dev9", ...),
+leaving exp_dev_init() -- the SSBUS setup, bay power-up and reset -- as
+dead code. The expansion bay therefore stays unpowered and the SPEED chip
+(ATA and SMAP Ethernet) is unreachable: a read of its registers from the
+EE at 0xb4000000 raises a data bus error.
+
+Remove the early return so the module does what it was written to do.
+Together with the iop_rpc_write() fix this brings the bay up at module
+load. Measured on an SCPH-30004 (ROM 0150): DEV9 power register 0000 ->
+0005, SPEED rev1 0011 rev3 0003 rev8 0002, EMAC3 soft reset completes,
+PHY DP83846 rev 3 answers on MII address 1 and reports link up at 100 Mbit
+full duplex with a cable plugged in and link down without, the MAC
+address reads from the serial EEPROM with a matching checksum, and the
+EE can read the SPEED registers directly once the bay is powered.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: hubix94 <hubix94@users.noreply.github.com>
+
+Upstream-Status: Submitted [https://github.com/frno7/linux/pull/96]
+---
+ drivers/ps2/iop-dev9.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/ps2/iop-dev9.c b/drivers/ps2/iop-dev9.c
+index a91cdd970..dbebed60e 100644
+--- a/drivers/ps2/iop-dev9.c
++++ b/drivers/ps2/iop-dev9.c
+@@ -252,8 +252,6 @@ static int __init iop_dev9_init(void)
+ 	if (err < 0)
+ 		return err;
+ 
+-	return 0;
+-
+ 	err = iop_dev9_read_rev(&dev9.rev);
+ 	if (err < 0) {
+ 		printk("iop_dev9_init: err %d\n", err);

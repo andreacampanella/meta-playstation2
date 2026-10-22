@@ -1,0 +1,57 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Fri, 16 Oct 2026 18:30:00 +0100
+Subject: [PATCH] MIPS: R5900: Use the FPU
+
+The R5900 FPU has 32 single precision registers and no double format.
+It does not follow IEEE 754: no NaN, no infinity, no denormals, and it
+rounds toward zero. The PlayStation 2 port kept it off and emulated
+every FPU instruction in software, which costs about 10 us a time.
+
+Turn it on. The R3000 style context code (CPU_R2300_FPU, 32-bit loads
+and stores) is already selected for this CPU, and the ELF loader accepts
+single float binaries. User space built with -march=r5900 -msingle-float
+runs its float math on the FPU and its double math in software. A build
+that uses double precision instructions (-march=mips3 with hard float)
+must not run on this kernel without "nofpu" on the command line, which
+keeps the emulation.
+
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+ arch/mips/include/asm/mach-ps2/cpu-feature-overrides.h |  1 -
+ arch/mips/kernel/cpu-probe.c                           | 10 +++++++++-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/include/asm/mach-ps2/cpu-feature-overrides.h b/arch/mips/include/asm/mach-ps2/cpu-feature-overrides.h
+index 4c42474..eafea5c 100644
+--- a/arch/mips/include/asm/mach-ps2/cpu-feature-overrides.h
++++ b/arch/mips/include/asm/mach-ps2/cpu-feature-overrides.h
+@@ -30,7 +30,6 @@
+ #define cpu_has_ejtag			0
+ #define cpu_has_ic_fills_f_dc		0
+ #define cpu_has_inclusive_pcaches	0
+-#define cpu_has_fpu 			0	/* FIXME */
+ #define cpu_has_toshiba_mmi		1	/* FIXME */
+ 
+ #endif /* __ASM_MACH_PS2_CPU_FEATURE_OVERRIDES_H */
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+index cd5097e..6169e33 100644
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -1472,7 +1472,15 @@ static inline void cpu_probe_legacy(struct cpuinfo_mips *c, unsigned int cpu)
+ 		__cpu_name[cpu] = "R5900";
+ 		c->isa_level = MIPS_CPU_ISA_III;
+ 		c->fpu_msk31 |= FPU_CSR_CONDX;
+-		c->options = R4K_OPTS | MIPS_CPU_DIVEC;
++		/*
++		 * The FPU has 32 single precision registers and no double
++		 * format. It does not follow IEEE 754: no NaN, no infinity,
++		 * no denormals, and it rounds toward zero. User space built
++		 * with -march=r5900 -msingle-float uses it. "nofpu" on the
++		 * kernel command line keeps the software emulation instead.
++		 */
++		c->options = R4K_OPTS | MIPS_CPU_DIVEC | MIPS_CPU_FPU |
++			     MIPS_CPU_32FPR;
+ 		c->tlbsize = 48;
+ 		break;
+ 	case PRID_IMP_NEVADA:

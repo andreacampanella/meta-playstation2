@@ -1,0 +1,108 @@
+From 3fe9ec22010e4fa352024e84c95cefdbd25e8e0e Mon Sep 17 00:00:00 2001
+From: hubix94 <hubix94@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 19:28:01 +0200
+Subject: [PATCH 4/5] MIPS: PS2: Register the SMAP Ethernet device
+
+Add the platform device the SMAP driver binds to: the 16 KiB SPEED
+register window at physical 0x14000000, which holds the registers, both
+FIFO data ports and the two buffer descriptor rings, and the three
+interrupts relayed from the IOP, named rx, tx and emac3 so the driver
+does not depend on their order.
+
+Enable the driver as a module in ps2_defconfig.
+
+Signed-off-by: hubix94 <hubix94@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+Upstream-Status: Submitted [https://github.com/frno7/linux/pull/96]
+---
+ arch/mips/configs/ps2_defconfig |  1 +
+ arch/mips/ps2/devices.c         | 56 +++++++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/arch/mips/configs/ps2_defconfig b/arch/mips/configs/ps2_defconfig
+index 4d2ab26ec..ac56f0af6 100644
+--- a/arch/mips/configs/ps2_defconfig
++++ b/arch/mips/configs/ps2_defconfig
+@@ -932,6 +932,7 @@ CONFIG_NET_VENDOR_MELLANOX=y
+ # CONFIG_NET_VENDOR_NI is not set
+ # CONFIG_ETHOC is not set
+ # CONFIG_NET_VENDOR_PENSANDO is not set
++CONFIG_PS2_SMAP=m
+ # CONFIG_NET_VENDOR_QUALCOMM is not set
+ # CONFIG_NET_VENDOR_RENESAS is not set
+ # CONFIG_NET_VENDOR_ROCKER is not set
+diff --git a/arch/mips/ps2/devices.c b/arch/mips/ps2/devices.c
+index 6fcfd377a..239bfacbe 100644
+--- a/arch/mips/ps2/devices.c
++++ b/arch/mips/ps2/devices.c
+@@ -73,6 +73,61 @@ static struct platform_device pata_device = {
+ 	.resource	= pata_resources,
+ };
+ 
++/*
++ * The SMAP part of the SPEED chip in the expansion bay.  The chip window
++ * starts at physical 0x14000000 and holds the ATA registers as well, at
++ * IOP_PATA_BASE, so SMAP is described as the two ranges it actually uses
++ * rather than as one block: the revision and interrupt registers below the
++ * ATA window, and everything from the buffer descriptor mode register up,
++ * which covers both FIFO data ports, the EMAC3 registers and the two
++ * descriptor rings.  Declaring the whole window instead would collide with
++ * the ATA device above and leave SMAP unregistered.
++ *
++ * The hardware only answers once iop-dev9 has powered the expansion bay,
++ * which the driver verifies through the IOP before it touches the window.
++ */
++#define SPEED_BASE	0x14000000
++
++static struct resource smap_resources[] = {
++	[0] = {
++		.name	= "speed",
++		.start	= SPEED_BASE,
++		.end	= SPEED_BASE + 0x3f,
++		.flags	= IORESOURCE_MEM,
++	},
++	[1] = {
++		.name	= "smap",
++		.start	= SPEED_BASE + 0x100,
++		.end	= SPEED_BASE + 0x3fff,
++		.flags	= IORESOURCE_MEM,
++	},
++	[2] = {
++		.name	= "rx",
++		.start	= IRQ_IOP_SPD_RXEND,
++		.end	= IRQ_IOP_SPD_RXEND,
++		.flags	= IORESOURCE_IRQ,
++	},
++	[3] = {
++		.name	= "tx",
++		.start	= IRQ_IOP_SPD_TXEND,
++		.end	= IRQ_IOP_SPD_TXEND,
++		.flags	= IORESOURCE_IRQ,
++	},
++	[4] = {
++		.name	= "emac3",
++		.start	= IRQ_IOP_SPD_EMAC3,
++		.end	= IRQ_IOP_SPD_EMAC3,
++		.flags	= IORESOURCE_IRQ,
++	},
++};
++
++static struct platform_device smap_device = {
++	.name		= "ps2-smap",
++	.id		= -1,
++	.num_resources	= ARRAY_SIZE(smap_resources),
++	.resource	= smap_resources,
++};
++
+ static struct resource gs_resources[] = {
+ 	[0] = {
+ 		.name	= "Graphics Synthesizer",
+@@ -113,6 +168,7 @@ static struct platform_device *ps2_platform_devices[] __initdata = {
+ 	&iop_device,
+ 	&ohci_device,
+ 	&pata_device,
++	&smap_device,
+ 	&gs_device,
+ 	&gs_drm_device,	/* FIXME */
+ 	&rtc_device,

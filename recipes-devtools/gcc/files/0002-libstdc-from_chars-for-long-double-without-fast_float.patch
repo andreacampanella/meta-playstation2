@@ -1,0 +1,27 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 11:10:00 +0100
+Subject: [PATCH] libstdc++: from_chars for long double without fast_float
+
+The fast_float parser is compiled only when float is IEEE binary32,
+and with -march=r5900 and hard float GCC gives float the format of the
+R5900 FPU, which is not. The from_chars overload for long double used
+the parser anyway when long double has the size of double, as on o32.
+Take the strtod path there as well, as the float and double overloads
+do.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+diff --git a/libstdc++-v3/src/c++17/floating_from_chars.cc b/libstdc++-v3/src/c++17/floating_from_chars.cc
+index b3061bd..6f514e8 100644
+--- a/libstdc++-v3/src/c++17/floating_from_chars.cc
++++ b/libstdc++-v3/src/c++17/floating_from_chars.cc
+@@ -1207,7 +1207,8 @@ from_chars_result
+ from_chars(const char* first, const char* last, long double& value,
+ 	   chars_format fmt) noexcept
+ {
+-#if __LDBL_MANT_DIG__ == __DBL_MANT_DIG__ || !defined USE_STRTOD_FOR_FROM_CHARS
++#if USE_LIB_FAST_FLOAT \
++    && (__LDBL_MANT_DIG__ == __DBL_MANT_DIG__ || !defined USE_STRTOD_FOR_FROM_CHARS)
+   // Either long double is the same as double, or we can't use strtold.
+   // In the latter case, this might give an incorrect result (e.g. values
+   // out of range of double give an error, even if they fit in long double).

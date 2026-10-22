@@ -1,0 +1,42 @@
+The code of this layer (recipes, classes, scripts, the library ps2gl, the
+demos and the tools) is under the MIT license below.
+
+The patches under recipes-*/*/files/*.patch change other projects and
+carry the license of the project they change: the Linux kernel, GCC,
+binutils, glibc and the IOP modules of iopmod are GPL-2.0 or later as
+each file says, libffi is MIT, SDL2 is Zlib. The kernel module snd-ps2
+and the IOP module spu2 are GPL-2.0-only, as their source files say.
+
+The games are separate projects under their own licenses, fetched at
+build time. Their data files are not part of this layer.
+
+Files with a credit of their own: tests/pcsx2check.cpp of the library is
+built with headers of the PCSX2 emulator and is GPL-3.0-or-later; the VU1
+simulator tests/vusim.c is a new implementation of the rules read in the
+PCSX2 interpreter; the sound module and its LIBSD import header follow
+the libsd and audsrv sources of ps2sdk (Academic Free License 2.0); the
+Doom platform file follows doomgeneric (GPL-2.0). Each file says so in
+its header. The README has the list of the projects this layer builds
+on.
+
+MIT License
+
+Copyright (c) 2026 Andrea Campanella
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

@@ -1,0 +1,26 @@
+
+PlayStation 2 Linux, meta-playstation2 version @VERSION@
+
+Commands:
+  ps2-doom [-iwad FILE]  Doom (Freedoom, or a WAD in ~/games/doom)
+  duke3d                 Duke Nukem 3D. Needs ~/games/duke3d/DUKE3D.GRP
+  duke3d-gl              The same game, drawn by the GS and VU1 (OpenGL)
+  quake                  Quake (OpenGL). Needs ~/games/quake/id1/pak0.pak
+  descent                Descent (OpenGL). Needs ~/games/descent/
+  ps2-disk status        The hard disk. apa-format + install: Linux on it
+  ps2demo-gl, ps2demo-gs Feature scenes, OpenGL or direct. Space: next
+  ps2gl-world [FRAMES]   3D room. Arrows to move, Escape to stop.
+  ps2gl-cubes [FRAMES]   27 cubes that turn
+  speaker-test -c 2 -t sine   Sound test. Volume: amixer sset Master 8191
+
+USB drive:  mount LABEL=PS2BOOT /mnt     Before power off: umount /mnt
+Network:    Connect a cable. The console shows the address ("ip addr").
+            From a PC: ssh root@ADDRESS
+Hard disk:  ps2-disk status
+OpenGL:     Set before a game, for example PS2GL_HUD=1 quake
+  PS2GL_HUD=1            Frame time, memory and swap on the screen
+  PS2GL_VERBOSE=2        The same numbers as text, once a second
+  PS2GL_VSYNC=0          No wait for the vertical sync (faster, tears)
+  PS2GL_SIZE=640x480     Window size (default 320x240, the GS scales it)
+  PS2GL_FOG=0            No fog
+

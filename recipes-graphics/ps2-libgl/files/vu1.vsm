@@ -1,0 +1,611 @@
+; SPDX-License-Identifier: MIT
+; The ps2gl VU1 program: transform, clip, fog, project.
+;
+; The host unpacks a batch into VU1 data memory and calls the program at 0.
+; The program:
+;   1. kicks the GS register settings packet,
+;   2. transforms each vertex to clip space and stores its clip flags,
+;   3. walks the primitives of the batch by kind. A primitive with all
+;      corners outside one plane is dropped. A primitive with all corners
+;      inside goes to the output as it is. The others go through the
+;      clipper (Sutherland-Hodgman against the six planes),
+;   4. projects each output vertex: divide by w, screen scale, fog factor,
+;      fixed point. The output is a list of GS primitives. When an output
+;      buffer is full, the program kicks it and fills the other one.
+;
+; Data memory layout, in quadwords:
+Q_CLIP = 0            ; clip matrix, one column in each quadword
+Q_SCALE = 4           ; screen scale x, y, z
+Q_OFFSET = 5          ; screen offset x, y, z
+Q_PARAM = 6           ; x = vertex count, y = kind, z = fog mode (integers)
+Q_FOGROW = 7          ; fog distance = dot(fogrow, (x, y, z, 1))
+Q_FOGPARAM = 8        ; x = A, y = B, z = 255, w = 1: linear f = A * d + B, exp f = e^(-A * d)
+Q_SETTINGS = 9        ; GIF tag with EOP, then 13 register settings
+Q_VERTEX_TAG = 23     ; GIF tag of the vertices, NLOOP 0, EOP set
+Q_VERTEX = 24         ; input vertices, 3 quadwords each: ST, RGBA, XYZ
+MAX_VERTICES = 186
+Q_CLIPA = 582         ; clipper buffers, 10 vertices each
+Q_CLIPB = 612
+Q_OUT0 = 642          ; output buffers: tag, then OUT_VERTICES vertices
+Q_OUT1 = 823
+OUT_VERTICES = 60
+Q_PLANES = 1004       ; six clip planes (x+, x-, y+, y-, z+, z-)
+Q_SCRATCH = 1010      ; y = vertices used by one primitive, z = saved vi12, w = fan base
+Q_SCRATCH2 = 1011     ; saved vi2, vi9, vi12 and the clipper output base
+Q_TRI = 1012          ; a fan triangle, in one piece for the clipper
+;
+; Kinds: 0 points, 1 lines, 2 line strip, 3 triangles, 4 triangle strip,
+; 5 fans. In a fan batch, bit 0x40 of XYZ.w on an input vertex starts a
+; fan. A triangle is a fan of 3 and a quad a fan of 4, so the host sends
+; all of them as kind 5 and they share one batch.
+; Fog modes: 0 none (A = 0, B = 1), 1 linear, 2 exp, 3 exp2.
+;
+; A vertex in memory, before the transform: ST = (s, t, 1, 0),
+; RGBA = integers, XYZ = (x, y, z, fan start). After: ST = (s, t, d, flags),
+; with the fan start in bit 0x40 of the flags,
+; RGBA = floats, XYZW = clip coordinates. In the output: ST = (s*q, t*q, q),
+; RGBA = integers, XYZF = fixed point x, y, z and fog, for XYZF2.
+;
+; Registers: vf1-4 clip matrix, vf9 scale, vf10 offset, vf11 fog row,
+; vf12 fog parameters, vf13 the plane in the clipper. vi2 input pointer,
+; vi3 count, vi4 kind, vi5 output pointer, vi6 output buffer, vi7 output
+; count, vi9 vertices left, vi12 input step, vi10/vi11 return addresses.
+;
+; A conditional branch reads an integer register one instruction late, so
+; one instruction always sits between the write of a register and a branch
+; that reads it.
+
+start:
+        NOP                                  | ILW.x vi3, Q_PARAM(vi0)
+        NOP                                  | ILW.y vi4, Q_PARAM(vi0)
+        NOP                                  | LQ.xyzw vf1, Q_CLIP(vi0)
+        NOP                                  | LQ.xyzw vf2, Q_CLIP+1(vi0)
+        NOP                                  | LQ.xyzw vf3, Q_CLIP+2(vi0)
+        NOP                                  | LQ.xyzw vf4, Q_CLIP+3(vi0)
+        NOP                                  | LQ.xyzw vf9, Q_SCALE(vi0)
+        NOP                                  | LQ.xyzw vf10, Q_OFFSET(vi0)
+        NOP                                  | LQ.xyzw vf11, Q_FOGROW(vi0)
+        NOP                                  | LQ.xyzw vf12, Q_FOGPARAM(vi0)
+        NOP                                  | IADDIU vi8, vi0, Q_SETTINGS
+        NOP                                  | IADDIU vi6, vi0, Q_OUT0
+        NOP                                  | XGKICK vi8                ; the register settings
+        NOP                                  | IADDIU vi5, vi6, 1
+        NOP                                  | IADDIU vi7, vi0, 0
+        NOP                                  | IADDIU vi2, vi0, Q_VERTEX
+        NOP                                  | IADD vi9, vi0, vi3
+
+; --- transform every vertex to clip space, in place ---------------------
+xform:
+        NOP                                  | LQ.xyzw vf5, 2(vi2)       ; x, y, z
+        NOP                                  | LQ.xyzw vf14, 1(vi2)      ; colors
+        MULAx.xyzw ACC, vf1, vf5x            | ILW.w vi13, 2(vi2)        ; the fan start
+        MADDAy.xyzw ACC, vf2, vf5y           | NOP
+        MADDAz.xyzw ACC, vf3, vf5z           | NOP
+        MADDw.xyzw vf6, vf4, vf0w            | NOP                       ; clip coordinates
+        MUL.xyz vf15, vf5, vf11              | NOP                       ; fog distance
+        ITOF0.xyzw vf14, vf14                | NOP
+        ADDx.z vf15, vf15, vf15x             | NOP
+        ADDy.z vf15, vf15, vf15y             | NOP
+        ADDw.z vf15, vf15, vf11w             | NOP
+        MAXx.z vf15, vf15, vf0x              | NOP                       ; d >= 0
+        CLIPw.xyz vf6, vf6                   | SQ.xyzw vf14, 1(vi2)
+        NOP                                  | SQ.xyzw vf6, 2(vi2)
+        NOP                                  | IADDI vi9, vi9, -1
+        NOP                                  | IADDIU vi1, vi0, 0x3f
+        NOP                                  | SQ.z vf15, 0(vi2)
+        NOP                                  | NOP
+        NOP                                  | FCGET vi8
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IAND vi8, vi8, vi1
+        NOP                                  | IOR vi8, vi8, vi13        ; with the fan start
+        NOP                                  | ISW.w vi8, 0(vi2)         ; the clip flags
+        NOP                                  | IADDIU vi2, vi2, 3
+        NOP                                  | IBNE vi9, vi0, xform
+        NOP                                  | NOP
+
+; --- walk the primitives by kind ------------------------------------------
+        NOP                                  | IADDIU vi2, vi0, Q_VERTEX
+        NOP                                  | IADDI vi1, vi4, -3
+        SUB.xyzw vf24, vf0, vf0              | IADD vi9, vi0, vi3        ; vertices left, no texture move
+        NOP                                  | IBGEZ vi1, triangles
+        NOP                                  | NOP
+        NOP                                  | IADDI vi1, vi4, -1
+        NOP                                  | NOP
+        NOP                                  | IBGEZ vi1, lines
+        NOP                                  | NOP
+
+; points: each vertex inside all planes goes out
+point_loop:
+        NOP                                  | IBLEZ vi9, finish
+        NOP                                  | NOP
+        NOP                                  | ILW.w vi1, 0(vi2)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IBNE vi1, vi0, point_next
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi2
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi1, vi0, OUT_VERTICES
+        NOP                                  | NOP
+        NOP                                  | IBNE vi7, vi1, point_next
+        NOP                                  | NOP
+        NOP                                  | BAL vi10, flush
+        NOP                                  | NOP
+point_next:
+        NOP                                  | IADDIU vi2, vi2, 3
+        NOP                                  | IADDI vi9, vi9, -1
+        NOP                                  | B point_loop
+        NOP                                  | NOP
+
+; lines: a list steps by 2 vertices, a strip by 1
+lines:
+        NOP                                  | IADDI vi1, vi4, -2
+        NOP                                  | IADDIU vi12, vi0, 3       ; strip: step 1 vertex
+        NOP                                  | IADDIU vi8, vi0, 1
+        NOP                                  | IBEQ vi1, vi0, line_setup
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi12, vi0, 6       ; list: step 2 vertices
+        NOP                                  | IADDIU vi8, vi0, 2
+line_setup:
+        NOP                                  | ISW.y vi8, Q_SCRATCH(vi0)
+line_loop:
+        NOP                                  | IADDI vi1, vi9, -2
+        NOP                                  | ILW.w vi8, 0(vi2)
+        NOP                                  | IBLTZ vi1, finish
+        NOP                                  | ILW.w vi13, 3(vi2)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IOR vi1, vi8, vi13        ; any corner outside
+        NOP                                  | IAND vi8, vi8, vi13       ; all corners outside one plane
+        NOP                                  | NOP
+        NOP                                  | IBNE vi8, vi0, line_next
+        NOP                                  | NOP
+        NOP                                  | IBNE vi1, vi0, line_clip
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi2
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi8, vi2, 3
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | B line_emitted
+        NOP                                  | NOP
+line_clip:
+        NOP                                  | IADD vi13, vi0, vi2
+        NOP                                  | IADDIU vi14, vi0, 2
+        NOP                                  | BAL vi11, clip_poly
+        NOP                                  | NOP
+        NOP                                  | IADDI vi1, vi14, -2
+        NOP                                  | NOP
+        NOP                                  | IBLTZ vi1, line_next
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi13       ; the first two vertices are the ends
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi8, vi13, 3
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+line_emitted:
+        NOP                                  | IADDIU vi1, vi0, OUT_VERTICES
+        NOP                                  | NOP
+        NOP                                  | IBNE vi7, vi1, line_next
+        NOP                                  | NOP
+        NOP                                  | BAL vi10, flush
+        NOP                                  | NOP
+line_next:
+        NOP                                  | IADD vi2, vi2, vi12
+        NOP                                  | ILW.y vi1, Q_SCRATCH(vi0)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | ISUB vi9, vi9, vi1
+        NOP                                  | B line_loop
+        NOP                                  | NOP
+
+; triangles: a list steps by 3 vertices, a strip by 1. Kind 5 is fans.
+triangles:
+        NOP                                  | IADDI vi1, vi4, -5
+        NOP                                  | NOP
+        NOP                                  | IBEQ vi1, vi0, fans
+        NOP                                  | NOP
+        NOP                                  | IADDI vi1, vi4, -4
+        NOP                                  | IADDIU vi12, vi0, 3
+        NOP                                  | IADDIU vi8, vi0, 1
+        NOP                                  | IBEQ vi1, vi0, tri_setup
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi12, vi0, 9
+        NOP                                  | IADDIU vi8, vi0, 3
+tri_setup:
+        NOP                                  | ISW.y vi8, Q_SCRATCH(vi0)
+tri_loop:
+        NOP                                  | IADDI vi1, vi9, -3
+        NOP                                  | ILW.w vi8, 0(vi2)
+        NOP                                  | IBLTZ vi1, finish
+        NOP                                  | ILW.w vi13, 3(vi2)
+        NOP                                  | ILW.w vi14, 6(vi2)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IOR vi1, vi8, vi13
+        NOP                                  | IAND vi8, vi8, vi13
+        NOP                                  | IOR vi1, vi1, vi14        ; any corner outside
+        NOP                                  | IAND vi8, vi8, vi14       ; all corners outside one plane
+        NOP                                  | NOP
+        NOP                                  | IBNE vi8, vi0, tri_next
+        NOP                                  | NOP
+        NOP                                  | IBNE vi1, vi0, tri_clip
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi2
+        NOP                                  | IADDIU vi13, vi2, 3
+        NOP                                  | IADDIU vi14, vi2, 6
+        NOP                                  | BAL vi11, emit_tri
+        NOP                                  | NOP
+        NOP                                  | B tri_next
+        NOP                                  | NOP
+tri_clip:
+        NOP                                  | IADD vi13, vi0, vi2
+        NOP                                  | IADDIU vi14, vi0, 3
+        NOP                                  | BAL vi11, clip_poly       ; polygon at vi13, vi14 vertices
+        NOP                                  | NOP
+        NOP                                  | IADDI vi3, vi14, -2       ; triangles in the fan
+        NOP                                  | IADDIU vi4, vi13, 3
+        NOP                                  | ISW.w vi13, Q_SCRATCH(vi0)
+fan_loop:
+        NOP                                  | IBLEZ vi3, tri_next
+        NOP                                  | NOP
+        NOP                                  | ILW.w vi8, Q_SCRATCH(vi0)
+        NOP                                  | IADD vi13, vi0, vi4
+        NOP                                  | IADDIU vi14, vi4, 3
+        NOP                                  | BAL vi11, emit_tri
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi4, vi4, 3
+        NOP                                  | IADDI vi3, vi3, -1
+        NOP                                  | B fan_loop
+        NOP                                  | NOP
+tri_next:
+        NOP                                  | IADD vi2, vi2, vi12
+        NOP                                  | ILW.y vi1, Q_SCRATCH(vi0)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | ISUB vi9, vi9, vi1
+        NOP                                  | B tri_loop
+        NOP                                  | NOP
+
+; fans: vi2 the next input vertex, vi9 the vertices left there, vi12 the
+; base of the fan, Q_SCRATCH x and y the two other corners of the triangle.
+; A triangle with a corner outside goes to the clipper in one piece at
+; Q_TRI. The first vertex of the batch starts a fan.
+fans:
+        NOP                                  | NOP
+fan_new:
+        NOP                                  | IADDI vi1, vi9, -3
+        NOP                                  | NOP
+        NOP                                  | IBLTZ vi1, finish
+        NOP                                  | NOP
+        NOP                                  | IADD vi12, vi0, vi2       ; base
+        NOP                                  | IADDIU vi13, vi2, 3       ; previous corner
+        NOP                                  | IADDIU vi14, vi2, 6       ; this corner
+        NOP                                  | IADDIU vi2, vi2, 9
+        NOP                                  | IADDI vi9, vi9, -3
+fan_tri:
+        NOP                                  | ISW.x vi13, Q_SCRATCH(vi0)
+        NOP                                  | ISW.y vi14, Q_SCRATCH(vi0)
+        NOP                                  | ILW.w vi8, 0(vi12)
+        NOP                                  | ILW.w vi3, 0(vi13)
+        NOP                                  | ILW.w vi4, 0(vi14)
+        NOP                                  | IADDIU vi1, vi0, 0x3f
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IAND vi8, vi8, vi1        ; the clip flags, no fan start
+        NOP                                  | IAND vi3, vi3, vi1
+        NOP                                  | IAND vi4, vi4, vi1
+        NOP                                  | IOR vi1, vi8, vi3
+        NOP                                  | IAND vi8, vi8, vi3
+        NOP                                  | IOR vi1, vi1, vi4         ; any corner outside
+        NOP                                  | IAND vi8, vi8, vi4        ; all corners outside one plane
+        NOP                                  | NOP
+        NOP                                  | IBNE vi8, vi0, fan_next
+        NOP                                  | NOP
+        NOP                                  | IBNE vi1, vi0, fan_clip
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi12
+        NOP                                  | BAL vi11, emit_tri
+        NOP                                  | NOP
+fan_next:
+        NOP                                  | IBLEZ vi9, finish
+        NOP                                  | NOP
+        NOP                                  | ILW.w vi1, 0(vi2)         ; the next vertex
+        NOP                                  | IADDIU vi8, vi0, 0x40
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IAND vi1, vi1, vi8
+        NOP                                  | NOP
+        NOP                                  | IBNE vi1, vi0, fan_new    ; it starts a fan
+        NOP                                  | NOP
+        NOP                                  | ILW.y vi13, Q_SCRATCH(vi0) ; previous = this corner
+        NOP                                  | IADD vi14, vi0, vi2       ; this = the next vertex
+        NOP                                  | IADDIU vi2, vi2, 3
+        NOP                                  | IADDI vi9, vi9, -1
+        NOP                                  | B fan_tri
+        NOP                                  | NOP
+fan_clip:
+        NOP                                  | LQ.xyzw vf5, 0(vi12)
+        NOP                                  | LQ.xyzw vf6, 1(vi12)
+        NOP                                  | LQ.xyzw vf7, 2(vi12)
+        NOP                                  | LQ.xyzw vf14, 0(vi13)
+        NOP                                  | LQ.xyzw vf15, 1(vi13)
+        NOP                                  | LQ.xyzw vf16, 2(vi13)
+        NOP                                  | LQ.xyzw vf17, 0(vi14)
+        NOP                                  | LQ.xyzw vf18, 1(vi14)
+        NOP                                  | LQ.xyzw vf19, 2(vi14)
+        NOP                                  | SQ.xyzw vf5, Q_TRI(vi0)
+        NOP                                  | SQ.xyzw vf6, Q_TRI+1(vi0)
+        NOP                                  | SQ.xyzw vf7, Q_TRI+2(vi0)
+        NOP                                  | SQ.xyzw vf14, Q_TRI+3(vi0)
+        NOP                                  | SQ.xyzw vf15, Q_TRI+4(vi0)
+        NOP                                  | SQ.xyzw vf16, Q_TRI+5(vi0)
+        NOP                                  | SQ.xyzw vf17, Q_TRI+6(vi0)
+        NOP                                  | SQ.xyzw vf18, Q_TRI+7(vi0)
+        NOP                                  | SQ.xyzw vf19, Q_TRI+8(vi0)
+        NOP                                  | IADDIU vi13, vi0, Q_TRI
+        NOP                                  | IADDIU vi14, vi0, 3
+        NOP                                  | BAL vi11, clip_poly       ; polygon at vi13, vi14 vertices
+        NOP                                  | NOP
+        NOP                                  | IADDI vi3, vi14, -2       ; triangles in the clipped fan
+        NOP                                  | IADDIU vi4, vi13, 3
+        NOP                                  | ISW.w vi13, Q_SCRATCH(vi0)
+fan_clip_loop:
+        NOP                                  | IBLEZ vi3, fan_next
+        NOP                                  | NOP
+        NOP                                  | ILW.w vi8, Q_SCRATCH(vi0)
+        NOP                                  | IADD vi13, vi0, vi4
+        NOP                                  | IADDIU vi14, vi4, 3
+        NOP                                  | BAL vi11, emit_tri
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi4, vi4, 3
+        NOP                                  | IADDI vi3, vi3, -1
+        NOP                                  | B fan_clip_loop
+        NOP                                  | NOP
+
+finish:
+        NOP                                  | NOP
+        NOP                                  | IBEQ vi7, vi0, done
+        NOP                                  | NOP
+        NOP                                  | BAL vi10, flush
+        NOP                                  | NOP
+done:
+        [E] NOP                              | NOP
+        NOP                                  | NOP
+
+; --- emit_tri: project the vertices at vi8, vi13, vi14 ----------------------
+; The GS loses texture precision with large texture coordinates. Each
+; triangle gets its coordinates moved by a whole number, the smallest of its
+; corners, so that they start near zero. With a repeating texture the move
+; is not visible. vf24 holds the move, and project subtracts it.
+emit_tri:
+        NOP                                  | LQ.xyzw vf20, 0(vi8)
+        NOP                                  | LQ.xyzw vf21, 0(vi13)
+        NOP                                  | LQ.xyzw vf22, 0(vi14)
+        MINI.xy vf24, vf20, vf21             | NOP
+        MINI.xy vf24, vf24, vf22             | NOP
+        FTOI0.xy vf24, vf24                  | NOP                       ; a whole number
+        ITOF0.xy vf24, vf24                  | NOP
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi13
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | IADD vi8, vi0, vi14
+        NOP                                  | BAL vi10, project
+        NOP                                  | NOP
+        NOP                                  | IADDIU vi1, vi0, OUT_VERTICES
+        NOP                                  | NOP
+        NOP                                  | IBNE vi7, vi1, emit_tri_done
+        NOP                                  | NOP
+        NOP                                  | BAL vi10, flush
+        NOP                                  | NOP
+emit_tri_done:
+        NOP                                  | JR vi11
+        NOP                                  | NOP
+
+; --- project: the vertex at vi8 to the output at vi5 -------------------------
+project:
+        NOP                                  | ILW.z vi1, Q_PARAM(vi0)   ; fog mode
+        NOP                                  | LQ.xyzw vf5, 2(vi8)       ; clip coordinates
+        NOP                                  | LQ.xyzw vf8, 0(vi8)       ; s, t, d
+        SUB.xy vf8, vf8, vf24                | NOP                       ; the texture move
+        NOP                                  | LQ.xyzw vf14, 1(vi8)      ; colors
+        NOP                                  | IADDI vi1, vi1, -2
+        NOP                                  | DIV Q, vf0w, vf5w         ; q = 1 / w
+        MULAw.xyz ACC, vf10, vf5w            | NOP                       ; offset * w
+        MADD.xyz vf7, vf9, vf5               | NOP                       ; + scale * clip
+        MULx.z vf15, vf8, vf12x              | IBLTZ vi1, fog_linear     ; A * d
+        NOP                                  | NOP
+        NOP                                  | IBLEZ vi1, fog_exp
+        NOP                                  | NOP
+        MUL.z vf15, vf15, vf15               | NOP                       ; exp2: (A * d)^2
+fog_exp:
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | EEXP P, vf15z
+        NOP                                  | WAITP
+        NOP                                  | MFP.z vf15, P
+        NOP                                  | B fog_done
+        NOP                                  | NOP
+fog_linear:
+        ADDy.z vf15, vf15, vf12y             | NOP                       ; A * d + B
+fog_done:
+        MINIw.z vf15, vf15, vf12w            | NOP                       ; at most 1
+        MAXx.z vf15, vf15, vf0x              | NOP                       ; at least 0
+        MULz.w vf7, vf12, vf15z              | WAITQ                     ; f (vf12.w = 1)
+        MULz.w vf7, vf7, vf12z               | NOP                       ; f * 255
+        MULq.xyz vf7, vf7, Q                 | NOP                       ; screen x, y, z
+        MULq.xy vf8, vf8, Q                  | NOP                       ; s * q, t * q
+        ADDq.z vf8, vf0, Q                   | NOP                       ; q
+        FTOI4.xyzw vf7, vf7                  | NOP
+        FTOI0.xyzw vf14, vf14                | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | SQ.xyzw vf8, 0(vi5)
+        NOP                                  | NOP
+        NOP                                  | SQ.xyzw vf14, 1(vi5)
+        NOP                                  | SQ.xyzw vf7, 2(vi5)
+        NOP                                  | IADDIU vi5, vi5, 3
+        NOP                                  | JR vi10
+        NOP                                  | IADDI vi7, vi7, 1
+
+; --- flush: kick the output buffer and switch to the other one ---------------
+flush:
+        NOP                                  | LQ.xyzw vf5, Q_VERTEX_TAG(vi0)
+        NOP                                  | ILW.x vi1, Q_VERTEX_TAG(vi0)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | SQ.xyzw vf5, 0(vi6)
+        NOP                                  | IOR vi1, vi1, vi7         ; NLOOP = vertex count
+        NOP                                  | ISW.x vi1, 0(vi6)
+        NOP                                  | IADDIU vi1, vi0, Q_OUT0 + Q_OUT1
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | XGKICK vi6
+        NOP                                  | ISUB vi6, vi1, vi6        ; the other buffer
+        NOP                                  | IADDIU vi5, vi6, 1
+        NOP                                  | JR vi10
+        NOP                                  | IADDIU vi7, vi0, 0
+
+; --- clip_poly: clip the polygon at vi13 (vi14 vertices, flags in vi1) ----
+; Result: polygon at vi13 with vi14 vertices. vi14 = 0 when nothing is left.
+clip_poly:
+        NOP                                  | ISW.x vi2, Q_SCRATCH2(vi0)
+        NOP                                  | ISW.y vi9, Q_SCRATCH2(vi0)
+        NOP                                  | ISW.z vi12, Q_SCRATCH2(vi0)
+        NOP                                  | IADD vi3, vi0, vi1        ; planes to clip against
+        NOP                                  | IADDIU vi2, vi0, 0x20
+        NOP                                  | IAND vi2, vi1, vi2
+        NOP                                  | IADDIU vi4, vi0, 0x3f
+        NOP                                  | IBEQ vi2, vi0, planes_known
+        NOP                                  | NOP
+        NOP                                  | IADD vi3, vi0, vi4        ; a corner behind the camera: every plane
+planes_known:
+        NOP                                  | IADDIU vi2, vi0, Q_PLANES
+        NOP                                  | IADDIU vi4, vi0, 1        ; plane bit
+        NOP                                  | IADDIU vi15, vi0, Q_CLIPA
+plane_loop:
+        NOP                                  | IAND vi1, vi3, vi4
+        NOP                                  | LQ.xyzw vf13, 0(vi2)
+        NOP                                  | IBEQ vi1, vi0, plane_next
+        NOP                                  | NOP
+        NOP                                  | ISW.w vi15, Q_SCRATCH2(vi0)
+        NOP                                  | BAL vi10, clip_plane
+        NOP                                  | NOP
+        NOP                                  | ILW.w vi13, Q_SCRATCH2(vi0) ; the output is the next input
+        NOP                                  | IADDIU vi1, vi0, Q_CLIPA + Q_CLIPB
+        NOP                                  | IBEQ vi14, vi0, clip_poly_done
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | ISUB vi15, vi1, vi13      ; the other buffer
+plane_next:
+        NOP                                  | IADDIU vi1, vi0, 64
+        NOP                                  | IADD vi4, vi4, vi4
+        NOP                                  | IADDIU vi2, vi2, 1
+        NOP                                  | IBNE vi4, vi1, plane_loop
+        NOP                                  | NOP
+clip_poly_done:
+        NOP                                  | ILW.x vi2, Q_SCRATCH2(vi0)
+        NOP                                  | ILW.y vi9, Q_SCRATCH2(vi0)
+        NOP                                  | ILW.z vi12, Q_SCRATCH2(vi0)
+        NOP                                  | JR vi11
+        NOP                                  | NOP
+
+; --- clip_plane: one plane (vf13), polygon vi13/vi14 to the buffer at vi15 --
+; Each edge a-b: a goes out when it is inside. The crossing point goes out
+; when the edge crosses the plane. vi14 counts the output vertices.
+clip_plane:
+        NOP                                  | IADD vi8, vi0, vi13       ; a
+        NOP                                  | IADD vi12, vi0, vi14      ; edges left
+        NOP                                  | IADDIU vi14, vi0, 0
+edge:
+        NOP                                  | IADDI vi1, vi12, -1
+        NOP                                  | IADDIU vi9, vi8, 3        ; b = the next vertex
+        NOP                                  | LQ.xyzw vf5, 2(vi8)
+        NOP                                  | IBNE vi1, vi0, not_last
+        NOP                                  | NOP
+        NOP                                  | IADD vi9, vi0, vi13       ; last edge: b = the first vertex
+not_last:
+        NOP                                  | LQ.xyzw vf6, 2(vi9)
+        MUL.xyzw vf15, vf5, vf13             | NOP
+        MUL.xyzw vf16, vf6, vf13             | NOP
+        ADDy.x vf15, vf15, vf15y             | NOP
+        ADDy.x vf16, vf16, vf16y             | NOP
+        ADDz.x vf15, vf15, vf15z             | NOP
+        ADDz.x vf16, vf16, vf16z             | NOP
+        ADDw.x vf15, vf15, vf15w             | NOP                       ; da
+        ADDw.x vf16, vf16, vf16w             | NOP                       ; db
+        ADDx.x vf17, vf0, vf15x              | NOP
+        ADDx.y vf17, vf0, vf16x              | NOP
+        ADDx.xyz vf18, vf0, vf15x            | NOP                       ; da in each field
+        MULx.z vf17, vf18, vf16x             | NOP                       ; da * db
+        MULx.w vf17, vf0, vf0x               | NOP                       ; 0
+        CLIPw.xyz vf17, vf17                 | NOP                       ; x-: da < 0, z-: crossing
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | FCAND vi1, 0x2            ; a outside
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IBNE vi1, vi0, a_out
+        NOP                                  | NOP
+        NOP                                  | LQ.xyzw vf18, 0(vi8)
+        NOP                                  | LQ.xyzw vf19, 1(vi8)
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | SQ.xyzw vf18, 0(vi15)
+        NOP                                  | SQ.xyzw vf19, 1(vi15)
+        NOP                                  | SQ.xyzw vf5, 2(vi15)
+        NOP                                  | IADDIU vi15, vi15, 3
+        NOP                                  | IADDI vi14, vi14, 1
+a_out:
+        NOP                                  | FCAND vi1, 0x20           ; the edge crosses the plane
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | IBEQ vi1, vi0, no_cross
+        NOP                                  | NOP
+        SUBx.x vf18, vf15, vf16x             | LQ.xyzw vf20, 0(vi8)      ; da - db
+        NOP                                  | LQ.xyzw vf21, 0(vi9)
+        NOP                                  | LQ.xyzw vf22, 1(vi8)
+        NOP                                  | LQ.xyzw vf23, 1(vi9)
+        NOP                                  | NOP
+        NOP                                  | DIV Q, vf15x, vf18x       ; t = da / (da - db)
+        SUB.xyzw vf21, vf21, vf20            | NOP
+        SUB.xyzw vf23, vf23, vf22            | NOP
+        SUB.xyzw vf6, vf6, vf5               | WAITQ
+        MULq.xyzw vf21, vf21, Q              | NOP
+        MULq.xyzw vf23, vf23, Q              | NOP
+        MULq.xyzw vf6, vf6, Q                | NOP
+        ADD.xyzw vf21, vf21, vf20            | NOP                       ; a + t * (b - a)
+        ADD.xyzw vf23, vf23, vf22            | NOP
+        ADD.xyzw vf6, vf6, vf5               | NOP
+        NOP                                  | NOP
+        NOP                                  | NOP
+        NOP                                  | SQ.xyzw vf21, 0(vi15)
+        NOP                                  | SQ.xyzw vf23, 1(vi15)
+        NOP                                  | SQ.xyzw vf6, 2(vi15)
+        NOP                                  | IADDIU vi15, vi15, 3
+        NOP                                  | IADDI vi14, vi14, 1
+no_cross:
+        NOP                                  | IADDIU vi8, vi8, 3
+        NOP                                  | IADDI vi12, vi12, -1
+        NOP                                  | NOP
+        NOP                                  | IBGTZ vi12, edge
+        NOP                                  | NOP
+        NOP                                  | JR vi10
+        NOP                                  | NOP

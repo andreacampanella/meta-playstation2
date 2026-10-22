@@ -1,0 +1,44 @@
+#!/bin/sh
+# Descent 1 (D1X-Rebirth) on the PlayStation 2, drawn by the GS and VU1
+# (OpenGL). The game data: descent.hog and descent.pig (shareware 1.4 or
+# the full game) in ~/games/descent, on the hard disk (/data/descent) or on
+# the FAT partition (/boot/descent), in that order. The game writes its
+# settings and the pilots in /home/root/descent.
+#
+# The engine needs a screen of at least 640x480: its pictures are 640x480,
+# and it refuses a texture taller than the screen. The SDL2 driver then
+# reports a 640x480 desktop and the library draws at 640x480 with 16-bit
+# buffers. SDL_PS2LINUX_DESKTOP=320x240 descent -lowresgraphics is the
+# small, fast version with the 320x200 pictures.
+#
+# -hogdir: the data directory.
+# -lowmem: less animation detail, for the 32 MiB of the console.
+# -nomovies: the movies need the full game.
+GAMES="${HOME:-/home/root}/games"
+HOME=/home/root/descent
+export HOME
+if [ -z "$SDL_PS2LINUX_DESKTOP" ]; then
+    SDL_PS2LINUX_DESKTOP=640x480
+    export SDL_PS2LINUX_DESKTOP
+fi
+mkdir -p "$HOME/.d1x-rebirth"
+if [ ! -f "$HOME/.d1x-rebirth/descent.cfg" ]; then
+    cp /usr/share/games/dxx-rebirth/descent.cfg "$HOME/.d1x-rebirth/descent.cfg"
+fi
+# TexFilt 1 ("upscale") makes every texture 16 times as large in RAM: the
+# engine enlarges it 4x on the CPU before OpenGL. Keep 0 (the size as is)
+# or 2 (smooth). The console has no RAM for 1.
+sed -i 's/^TexFilt=1$/TexFilt=0/' "$HOME/.d1x-rebirth/descent.cfg"
+HOGDIR=""
+for d in "$GAMES/descent" /data/descent /boot/descent; do
+    if [ -f "$d/descent.hog" ] || [ -f "$d/DESCENT.HOG" ]; then
+        HOGDIR=$d
+        break
+    fi
+done
+if [ -z "$HOGDIR" ]; then
+    echo "descent: no descent.hog. Put it and descent.pig in $GAMES/descent/" >&2
+    exit 1
+fi
+exec /usr/libexec/dxx-rebirth/d1x-rebirth -hogdir "$HOGDIR" -lowmem \
+    -nomovies "$@"

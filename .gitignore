@@ -1,0 +1,5 @@
+# kas puts Poky and the build next to the layer. These are for a run
+# inside the repository.
+/build/
+/poky/
+__pycache__/

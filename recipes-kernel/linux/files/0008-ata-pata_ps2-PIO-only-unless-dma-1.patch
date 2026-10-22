@@ -1,0 +1,44 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Subject: [PATCH] ata: pata_ps2: PIO only unless dma=1
+
+The DMA transfers run on the IOP while the main CPU reads the ATA
+registers of the interface. With a fast disk (a SATA SSD on a bridge)
+the main CPU reads the status register while the DMA still holds the
+interface, and gets a data bus error in ata_sff_check_status during a
+write. PIO moves the data through the main CPU and has no such race.
+
+Leave the DMA modes off unless the module parameter dma=1 is given.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+
+--- a/drivers/ata/pata_ps2.c
++++ b/drivers/ata/pata_ps2.c
+@@ -27,6 +27,15 @@
+ 
+ #define DRV_NAME "pata-ps2"
+ 
++/*
++ * DMA runs on the IOP while the main CPU reads the ATA registers, and with
++ * a fast disk the two meet: a bus error on the status register during a
++ * write. PIO is safe. dma=1 turns the DMA modes on.
++ */
++static bool pata_ps2_dma;
++module_param_named(dma, pata_ps2_dma, bool, 0444);
++MODULE_PARM_DESC(dma, "Use the DMA modes (default: PIO only)");
++
+ #define MAX_ATA_SIF_SG (SIF_CMD_PACKET_DATA_MAX / sizeof(struct ata_sif_payload_sg))
+ 
+ /**
+@@ -395,8 +404,10 @@
+ 
+ 	ap->ops = &pata_ps2_port_ops;
+ 	ap->pio_mask   = ATA_PIO4;
+-	ap->mwdma_mask = ATA_MWDMA2;
+-	ap->udma_mask  = ATA_UDMA4;	// FIXME: ATA_UDMA5?
++	if (pata_ps2_dma) {
++		ap->mwdma_mask = ATA_MWDMA2;
++		ap->udma_mask  = ATA_UDMA4;	// FIXME: ATA_UDMA5?
++	}
+ 	ap->flags     |= ATA_FLAG_NO_ATAPI;
+ 
+ 	pp->dev = &pdev->dev;

@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+#
+# kas configuration: fetch Poky and build the USB drive image of meta-playstation2.
+#
+#   pip install kas
+#   kas build meta-playstation2/kas/ps2.yml
+#
+# or, with every host tool in a container (Docker or Podman, nothing else
+# on the PC):
+#
+#   kas-container build meta-playstation2/kas/ps2.yml
+#
+# Run it from the directory that holds meta-playstation2:
+#
+#   git clone https://github.com/<you>/meta-playstation2
+#   kas build meta-playstation2/kas/ps2.yml
+#
+# kas fetches Poky into that directory, makes build/ there, and builds
+# ps2-image-usb. The image is
+# build/tmp/deploy/images/ps2/ps2-image-usb-ps2.rootfs.wic.gz. The first
+# build takes a few hours.
+#
+# The desktop image (X and matchbox):
+#   kas build meta-playstation2/kas/ps2.yml:meta-playstation2/kas/x11.yml
+# Other targets: kas build meta-playstation2/kas/ps2.yml --target ps2-iso
+# A shell in the build environment: kas shell meta-playstation2/kas/ps2.yml
+#
+# The game data is not part of the build. Copy it to ~/games/ on the
+# console.
+
+header:
+  version: 14
+
+machine: ps2
+distro: poky
+target: ps2-image-usb
+
+repos:
+  # This layer: the repository that holds this file. No URL and no path,
+  # so kas uses the files as they are.
+  meta-playstation2:
+
+  # Poky, at the commit the layer was built and tested with. Change the
+  # commit to move to a newer scarthgap.
+  poky:
+    url: https://git.yoctoproject.org/poky
+    branch: scarthgap
+    commit: 104772c5fd0653290cbb5e4b77813343957939cc
+    layers:
+      meta:
+      meta-poky:
+
+local_conf_header:
+  meta-playstation2: |
+    INIT_MANAGER = "mdev-busybox"
+    DEFAULTTUNE = "r5900el-fpu"

@@ -1,0 +1,139 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 11:00:00 +0100
+Subject: [PATCH] mips: ucontext with 32-bit FPU stores on the R5900
+
+getcontext, setcontext and swapcontext keep the callee-saved FPU
+registers with the s.d and l.d macros, which GAS refuses for the R5900.
+Store and load the two singles of each pair with swc1 and lwc1, with the
+names fpregdef.h has for the high halves (fs0f is $f21).
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+diff --git a/sysdeps/unix/sysv/linux/mips/getcontext.S b/sysdeps/unix/sysv/linux/mips/getcontext.S
+index e3824b9..42ce285 100644
+--- a/sysdeps/unix/sysv/linux/mips/getcontext.S
++++ b/sysdeps/unix/sysv/linux/mips/getcontext.S
+@@ -105,12 +105,28 @@ NESTED (__getcontext, FRAMESZ, ra)
+ 	s.d	fs7, (31 * SZREG + MCONTEXT_FPREGS)(a0)
+ 
+ # else  /* _MIPS_SIM != _ABI64 */
++# ifdef _MIPS_ARCH_R5900
++	/* No sdc1 and ldc1: the two singles of each pair.  */
++	swc1	fs0, (20 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs0f, (21 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs1, (22 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs1f, (23 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs2, (24 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs2f, (25 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs3, (26 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs3f, (27 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs4, (28 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs4f, (29 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs5, (30 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs5f, (31 * SZREG + MCONTEXT_FPREGS)(a0)
++# else
+ 	s.d	fs0, (20 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs1, (22 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs2, (24 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs3, (26 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs4, (28 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs5, (30 * SZREG + MCONTEXT_FPREGS)(a0)
++# endif
+ 
+ # endif /* _MIPS_SIM != _ABI64 */
+ 
+diff --git a/sysdeps/unix/sysv/linux/mips/setcontext.S b/sysdeps/unix/sysv/linux/mips/setcontext.S
+index 0dd03ab..2c339e3 100644
+--- a/sysdeps/unix/sysv/linux/mips/setcontext.S
++++ b/sysdeps/unix/sysv/linux/mips/setcontext.S
+@@ -102,12 +102,28 @@ NESTED (__setcontext, FRAMESZ, ra)
+ 	l.d	fs7, (31 * SZREG + MCONTEXT_FPREGS)(v0)
+ 
+ # else  /* _MIPS_SIM != _ABI64 */
++# ifdef _MIPS_ARCH_R5900
++	/* No sdc1 and ldc1: the two singles of each pair.  */
++	lwc1	fs0, (20 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs0f, (21 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs1, (22 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs1f, (23 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs2, (24 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs2f, (25 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs3, (26 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs3f, (27 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs4, (28 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs4f, (29 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs5, (30 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs5f, (31 * SZREG + MCONTEXT_FPREGS)(v0)
++# else
+ 	l.d	fs0, (20 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs1, (22 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs2, (24 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs3, (26 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs4, (28 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs5, (30 * SZREG + MCONTEXT_FPREGS)(v0)
++# endif
+ 
+ # endif /* _MIPS_SIM != _ABI64 */
+ 
+diff --git a/sysdeps/unix/sysv/linux/mips/swapcontext.S b/sysdeps/unix/sysv/linux/mips/swapcontext.S
+index 1f13f22..939359e 100644
+--- a/sysdeps/unix/sysv/linux/mips/swapcontext.S
++++ b/sysdeps/unix/sysv/linux/mips/swapcontext.S
+@@ -114,12 +114,28 @@ NESTED (__swapcontext, FRAMESZ, ra)
+ 	s.d	fs7, (31 * SZREG + MCONTEXT_FPREGS)(a0)
+ 
+ # else  /* _MIPS_SIM != _ABI64 */
++# ifdef _MIPS_ARCH_R5900
++	/* No sdc1 and ldc1: the two singles of each pair.  */
++	swc1	fs0, (20 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs0f, (21 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs1, (22 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs1f, (23 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs2, (24 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs2f, (25 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs3, (26 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs3f, (27 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs4, (28 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs4f, (29 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs5, (30 * SZREG + MCONTEXT_FPREGS)(a0)
++	swc1	fs5f, (31 * SZREG + MCONTEXT_FPREGS)(a0)
++# else
+ 	s.d	fs0, (20 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs1, (22 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs2, (24 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs3, (26 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs4, (28 * SZREG + MCONTEXT_FPREGS)(a0)
+ 	s.d	fs5, (30 * SZREG + MCONTEXT_FPREGS)(a0)
++# endif
+ 
+ # endif /* _MIPS_SIM != _ABI64 */
+ 
+@@ -153,12 +169,28 @@ NESTED (__swapcontext, FRAMESZ, ra)
+ 	l.d	fs7, (31 * SZREG + MCONTEXT_FPREGS)(v0)
+ 
+ # else  /* _MIPS_SIM != _ABI64 */
++# ifdef _MIPS_ARCH_R5900
++	/* No sdc1 and ldc1: the two singles of each pair.  */
++	lwc1	fs0, (20 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs0f, (21 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs1, (22 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs1f, (23 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs2, (24 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs2f, (25 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs3, (26 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs3f, (27 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs4, (28 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs4f, (29 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs5, (30 * SZREG + MCONTEXT_FPREGS)(v0)
++	lwc1	fs5f, (31 * SZREG + MCONTEXT_FPREGS)(v0)
++# else
+ 	l.d	fs0, (20 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs1, (22 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs2, (24 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs3, (26 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs4, (28 * SZREG + MCONTEXT_FPREGS)(v0)
+ 	l.d	fs5, (30 * SZREG + MCONTEXT_FPREGS)(v0)
++# endif
+ 
+ # endif /* _MIPS_SIM != _ABI64 */
+ 

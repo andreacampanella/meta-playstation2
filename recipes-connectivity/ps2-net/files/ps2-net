@@ -1,0 +1,69 @@
+#!/bin/sh
+# Start the network and the SSH server on the PlayStation 2.
+#
+# 1. Load the driver for the Ethernet port of the network adapter, and the
+#    driver for each USB device (a USB network adapter is one of them).
+# 2. Wait for a network interface with a cable link.
+# 3. Get an address with DHCP. If no server answers, use the fixed address.
+# 4. Start the SSH server (dropbear).
+#
+# BusyBox init starts this script once. The script waits until an adapter
+# appears, so you can connect the adapter after the system start.
+
+FALLBACK="@FALLBACK@"
+NAME="$(cat /etc/hostname 2>/dev/null || echo ps2)"
+
+log() {
+    echo "ps2-net: $*" > /dev/console
+}
+
+# Print the first interface of a real device that has a link.
+find_interface() {
+    for d in /sys/class/net/*; do
+        [ -e "$d/device" ] || continue
+        ip link set "${d##*/}" up 2>/dev/null
+        if [ "$(cat "$d/carrier" 2>/dev/null)" = 1 ]; then
+            echo "${d##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The Ethernet port of the network adapter. iop-dev9 gives power to the
+# expansion bay, so it must load first.
+modprobe -q iop-dev9 2>/dev/null
+modprobe -q ps2-smap 2>/dev/null
+
+seen=""
+iface=""
+while [ -z "$iface" ]; do
+    for f in /sys/bus/usb/devices/*/modalias; do
+        [ -r "$f" ] || continue
+        alias="$(cat "$f")"
+        case " $seen " in
+        *" $alias "*) ;;
+        *)
+            seen="$seen $alias"
+            modprobe -q "$alias" 2>/dev/null
+            ;;
+        esac
+    done
+    iface="$(find_interface)" || sleep 3
+done
+
+log "interface $iface"
+
+if ! udhcpc -i "$iface" -n -t 10 -T 3 -x "hostname:$NAME" > /dev/null 2>&1; then
+    log "no DHCP answer, fixed address $FALLBACK"
+    ip addr add "$FALLBACK" dev "$iface"
+fi
+
+if ! pidof dropbear > /dev/null; then
+    mkdir -p /etc/dropbear
+    # -R: make the host key at the first connection. -B: permit the empty password.
+    dropbear -R -B
+fi
+
+address="$(ip -4 addr show "$iface" | awk '/inet / { print $2; exit }')"
+log "ssh root@${address%/*}"

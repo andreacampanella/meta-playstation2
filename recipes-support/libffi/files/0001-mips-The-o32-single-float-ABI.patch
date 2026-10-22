@@ -1,0 +1,235 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 11:30:00 +0100
+Subject: [PATCH] mips: The o32 single-float ABI
+
+With -msingle-float (the R5900 of the PlayStation 2, whose FPU has no
+double format) the o32 ABI passes a double in integer registers and
+returns it in $v0 and $v1, as the soft-float ABI does. A float still
+goes in $f12 or $f14 and comes back in $f0.
+
+ffi.c: O32_DOUBLE_IN_FPR is 0 with __mips_single_float. A double is
+then never flagged for a float register, and a double return takes the
+$v0/$v1 path, in calls and in closures.
+
+o32.S: the l.d and s.d of double values are out of the single-float
+build (GAS has no ldc1/sdc1 for the R5900 and they are unreachable
+there), closures save the two float registers with s.s, and a double
+return value goes through $v0/$v1. A complex double return is not
+handled, as with soft float.
+
+Upstream-Status: Inappropriate [PlayStation 2 port; a candidate for upstream]
+
+--- a/src/mips/ffi.c	2024-02-15 12:54:35.000000000 +0000
++++ b/src/mips/ffi.c	2026-10-17 11:02:06.091019741 +0100
+@@ -29,6 +29,15 @@
+ #include <ffi.h>
+ #include <ffi_common.h>
+ 
++/* With -msingle-float the FPU has no double format.  A double is passed
++   and returned as with soft float, in integer registers.  A float keeps
++   $f12, $f14 and $f0.  */
++#ifdef __mips_single_float
++# define O32_DOUBLE_IN_FPR 0
++#else
++# define O32_DOUBLE_IN_FPR 1
++#endif
++
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -400,6 +409,9 @@
+ #ifdef FFI_MIPS_O32
+   /* Set the flags necessary for O32 processing.  FFI_O32_SOFT_FLOAT
+    * does not have special handling for floating point args.
++   * With -msingle-float (O32_DOUBLE_IN_FPR is 0) a double goes in
++   * integer registers like a long long, and only a float takes $f12
++   * or $f14.
+    */
+ 
+   if (cif->rtype->type != FFI_TYPE_STRUCT && cif->rtype->type != FFI_TYPE_COMPLEX && cif->abi == FFI_O32)
+@@ -408,8 +420,11 @@
+ 	{
+ 	  switch ((cif->arg_types)[0]->type)
+ 	    {
+-	    case FFI_TYPE_FLOAT:
+ 	    case FFI_TYPE_DOUBLE:
++	      if (!O32_DOUBLE_IN_FPR)
++		break;
++	      /* fall through */
++	    case FFI_TYPE_FLOAT:
+ 	      cif->flags += (cif->arg_types)[0]->type;
+ 	      break;
+ 	      
+@@ -425,8 +440,11 @@
+ 		{
+ 		  switch ((cif->arg_types)[1]->type)
+ 		    {
+-		    case FFI_TYPE_FLOAT:
+ 		    case FFI_TYPE_DOUBLE:
++		      if (!O32_DOUBLE_IN_FPR)
++			break;
++		      /* fall through */
++		    case FFI_TYPE_FLOAT:
+ 		      cif->flags += (cif->arg_types)[1]->type << FFI_FLAG_BITS;
+ 		      break;
+ 		      
+@@ -438,9 +456,11 @@
+ 	}
+     }
+       
+-  /* Set the return type flag */
++  /* Set the return type flag.  A double comes back in $v0 and $v1 with
++     soft float, and with single float as well.  */
+ 
+-  if (cif->abi == FFI_O32_SOFT_FLOAT)
++  if (cif->abi == FFI_O32_SOFT_FLOAT
++      || (!O32_DOUBLE_IN_FPR && cif->rtype->type == FFI_TYPE_DOUBLE))
+     {
+       switch (cif->rtype->type)
+         {
+@@ -994,8 +1014,9 @@
+         argn++;
+       if (i < 2 && !seen_int &&
+ 	  (arg_types[i]->type == FFI_TYPE_FLOAT ||
+-	   arg_types[i]->type == FFI_TYPE_DOUBLE ||
+-	   arg_types[i]->type == FFI_TYPE_LONGDOUBLE))
++	   (O32_DOUBLE_IN_FPR &&
++	    (arg_types[i]->type == FFI_TYPE_DOUBLE ||
++	     arg_types[i]->type == FFI_TYPE_LONGDOUBLE))))
+ 	{
+ #if defined(__MIPSEB__) || defined(_MIPSEB)
+ 	  if (arg_types[i]->type == FFI_TYPE_FLOAT)
+@@ -1041,7 +1062,8 @@
+   /* Invoke the closure. */
+   fun(cif, rvalue, avaluep, user_data);
+ 
+-  if (cif->abi == FFI_O32_SOFT_FLOAT)
++  if (cif->abi == FFI_O32_SOFT_FLOAT
++      || (!O32_DOUBLE_IN_FPR && cif->rtype->type == FFI_TYPE_DOUBLE))
+     {
+       switch (cif->rtype->type)
+         {
+--- a/src/mips/o32.S	2023-03-15 14:19:45.000000000 +0000
++++ b/src/mips/o32.S	2026-10-17 11:02:06.091118306 +0100
+@@ -85,6 +85,8 @@
+ #ifndef __mips_soft_float
+ 	bnez	t0, pass_d			# make it quick for int
+ #endif
++	# With -msingle-float a double goes in integer registers, so
++	# ffi_prep_cif_machdep never asks for the l.d loads below.
+ 	REG_L	a0, 0*FFI_SIZEOF_ARG($sp)	# just go ahead and load the
+ 	REG_L	a1, 1*FFI_SIZEOF_ARG($sp)	# four regs.
+ 	REG_L	a2, 2*FFI_SIZEOF_ARG($sp)
+@@ -94,7 +96,9 @@
+ #ifndef __mips_soft_float
+ pass_d:
+ 	bne	t0, FFI_ARGS_D, pass_f
++#ifndef __mips_single_float
+ 	l.d	$f12, 0*FFI_SIZEOF_ARG($sp)	# load $fp regs from args
++#endif
+ 	REG_L	a2,   2*FFI_SIZEOF_ARG($sp)	# passing a double
+ 	REG_L	a3,   3*FFI_SIZEOF_ARG($sp)
+ 	b	call_it
+@@ -109,8 +113,12 @@
+ 
+ pass_d_d:		
+ 	bne	t0, FFI_ARGS_DD, pass_f_f
++#ifndef __mips_single_float
+ 	l.d	$f12, 0*FFI_SIZEOF_ARG($sp)	# load $fp regs from args
++#endif
++#ifndef __mips_single_float
+ 	l.d	$f14, 2*FFI_SIZEOF_ARG($sp)	# passing two doubles
++#endif
+ 	b	call_it
+ 
+ pass_f_f:	
+@@ -123,7 +131,9 @@
+ 
+ pass_d_f:		
+ 	bne	t0, FFI_ARGS_DF, pass_f_d
++#ifndef __mips_single_float
+ 	l.d	$f12, 0*FFI_SIZEOF_ARG($sp)	# load $fp regs from args
++#endif
+ 	l.s	$f14, 2*FFI_SIZEOF_ARG($sp)	# passing double and float
+ 	REG_L	a3,   3*FFI_SIZEOF_ARG($sp)
+ 	b	call_it
+@@ -132,7 +142,9 @@
+  # assume that the only other combination must be float then double
+  #	bne	t0, FFI_ARGS_F_D, call_it
+ 	l.s	$f12, 0*FFI_SIZEOF_ARG($sp)	# load $fp regs from args
++#ifndef __mips_single_float
+ 	l.d	$f14, 2*FFI_SIZEOF_ARG($sp)	# passing double and float
++#endif
+ 
+ #endif
+ 
+@@ -178,7 +190,7 @@
+ 	bne	t1, FFI_TYPE_DOUBLE, retcomplex
+ 	jalr	t9
+ 	REG_L	t0, SIZEOF_FRAME + 4*FFI_SIZEOF_ARG($fp)
+-#ifndef __mips_soft_float
++#if !defined __mips_soft_float && !defined __mips_single_float
+ 	s.d	$f0, 0(t0)
+ #else
+ 	REG_S	v1, 4(t0)
+@@ -215,7 +227,7 @@
+ #endif
+ 	b	epilogue
+ 3:
+-#ifndef __mips_soft_float
++#if !defined __mips_soft_float && !defined __mips_single_float
+ 	s.d	$f0, 0(t0)
+ 	s.d	$f2, 8(t0)
+ #else
+@@ -326,7 +338,11 @@
+ 	li	$13, 1		# FFI_O32
+ 	bne	$16, $13, 1f	# Skip fp save if FFI_O32_SOFT_FLOAT
+ 	
+-#ifndef __mips_soft_float
++#if defined __mips_single_float
++	# Store the float registers: no double goes in them.
++	s.s	$f12, FA_0_0_OFF2($fp)
++	s.s	$f14, FA_1_0_OFF2($fp)
++#elif !defined __mips_soft_float
+ 	# Store all possible float/double registers.
+ 	s.d	$f12, FA_0_0_OFF2($fp)
+ 	s.d	$f14, FA_1_0_OFF2($fp)
+@@ -383,7 +399,11 @@
+ 	li	$13, 1		# FFI_O32
+ 	bne	$16, $13, 1f	# Skip fp save if FFI_O32_SOFT_FLOAT
+ 	
+-#ifndef __mips_soft_float
++#if defined __mips_single_float
++	# Store the float registers: no double goes in them.
++	s.s	$f12, FA_0_0_OFF2($fp)
++	s.s	$f14, FA_1_0_OFF2($fp)
++#elif !defined __mips_soft_float
+ 	# Store all possible float/double registers.
+ 	s.d	$f12, FA_0_0_OFF2($fp)
+ 	s.d	$f14, FA_1_0_OFF2($fp)
+@@ -419,9 +439,11 @@
+ 	l.s	$f0, V0_OFF2($fp)
+ 	beq	$8, $9, closure_done
+ 
++#ifndef __mips_single_float
+ 	li	$9, FFI_TYPE_DOUBLE
+ 	l.d	$f0, V0_OFF2($fp)
+ 	beq	$8, $9, closure_done
++#endif
+ 
+ 	li      $9, FFI_TYPE_COMPLEX
+ 	bne     $8, $9, 1f
+@@ -431,11 +453,13 @@
+ 	l.s	$f2, V1_OFF2($fp)
+ 	beq     $3, $9, closure_done
+ 
++#ifndef __mips_single_float
+ 	li      $9, 16
+ 	l.d	$f0, V0_OFF2($fp)
+ 	l.d	$f2, (V0_OFF2+8)($fp)
+ 	beq     $3, $9, closure_done
+ #endif
++#endif
+ 1:	
+ 	REG_L	$3, V1_OFF2($fp)
+ 	REG_L	$2, V0_OFF2($fp)

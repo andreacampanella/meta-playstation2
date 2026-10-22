@@ -1,0 +1,36 @@
+From 374b5337667762396079eaa7399ba07dd71e3d09 Mon Sep 17 00:00:00 2001
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Mon, 19 Oct 2026 09:26:30 +0100
+Subject: [PATCH 2/2] ALSA: mips: Add the option SND_PS2 for the PlayStation 2
+
+The option selects the PCM core. The driver snd-ps2 builds outside the
+tree, with the IOP module that drives the SPU2.
+
+Upstream-Status: Pending
+---
+ sound/mips/Kconfig | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/sound/mips/Kconfig b/sound/mips/Kconfig
+index 8a33402fd..752f47bd8 100644
+--- a/sound/mips/Kconfig
++++ b/sound/mips/Kconfig
+@@ -10,6 +10,15 @@ menuconfig SND_MIPS
+ 
+ if SND_MIPS
+ 
++config SND_PS2
++	tristate "Sony PlayStation 2 SPU2"
++	depends on SONY_PS2
++	select SND_PCM
++	help
++	  The ALSA core for the PlayStation 2 sound processor. The driver
++	  itself, snd-ps2, builds outside the tree, with the IOP module
++	  that drives the SPU2.
++
+ config SND_SGI_O2
+ 	tristate "SGI O2 Audio"
+ 	depends on SGI_IP32
+-- 
+2.43.0
+

@@ -1,0 +1,46 @@
+From 7f9acefdfc995adb00b76861dedef12050c91aae Mon Sep 17 00:00:00 2001
+From: hubix94 <hubix94@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 17:06:21 +0200
+Subject: [PATCH 1/5] MIPS: PS2: IOP: Fix iop_write{b,w,l}() issuing the
+ LOADFILE read RPC
+
+iop_rpc_write() sends its { addr, type, data } argument with rpo_get_addr
+(3) instead of rpo_set_addr (2). LOADFILE therefore performs a read at
+addr, discards data, and returns the current value, which iop_rpc_write()
+passes on as a non-negative "status". Every caller that tests for err < 0
+sees success while nothing has been written.
+
+Measured on an SCPH-30004 (ROM 0150) by replaying the exp_dev_init()
+sequence from iop-dev9.c through iop_writel()/iop_writew() and reading the
+registers back over the SIF: with rpo_get_addr all writes "succeed" and
+the SSBUS registers 0x1418/0x141c/0x1420 keep their reset values
+000000ff/001a1055/000510ff and DEV9 power stays 0000; with rpo_set_addr
+the same sequence reads back e01a3043/ef1a3043/00051011 and DEV9 power
+becomes 0005, the expansion bay powers up and the SPEED chip answers.
+
+Nothing in the tree besides the dead code in iop_dev9_init() calls the
+write helpers yet, which is why this went unnoticed.
+
+Fixes: 2e3a8389d92a ("FIXME: iop_read[bwl] and iop_write[bwl]")
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: hubix94 <hubix94@users.noreply.github.com>
+
+Upstream-Status: Submitted [https://github.com/frno7/linux/pull/96]
+---
+ drivers/ps2/iop-module-request.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/ps2/iop-module-request.c b/drivers/ps2/iop-module-request.c
+index 9f246d051..83e758722 100644
+--- a/drivers/ps2/iop-module-request.c
++++ b/drivers/ps2/iop-module-request.c
+@@ -932,7 +932,7 @@ static int iop_rpc_write(const u32 data,
+ 	s32 status;
+ 	int err;
+ 
+-	err = sif_rpc(&load_file_rpc_client, rpo_get_addr,
++	err = sif_rpc(&load_file_rpc_client, rpo_set_addr,
+ 		&arg, sizeof(arg), &status, sizeof(status));
+ 
+ 	return err < 0 ? err : status;

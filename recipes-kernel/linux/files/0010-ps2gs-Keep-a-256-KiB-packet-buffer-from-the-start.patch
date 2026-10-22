@@ -1,0 +1,101 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Subject: [PATCH] ps2gs: Keep a 256 KiB packet buffer from the start
+
+A program maps its packet buffer with mmap(), and the driver allocated
+it then, as one piece of 256 KiB by default. After a while of swapping
+no piece of that size is left, and the mmap() failed with ENOMEM:
+"ps2gl: mmap: Cannot allocate memory", and the game stopped.
+
+Take one buffer of 256 KiB when the driver starts, while memory is
+still in large pieces, and hand it to the mmap() of each program that
+asks for that size or less. Only one program opens the device at a
+time, so one buffer serves. A larger request allocates as before.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+
+--- a/drivers/ps2/gs-dev.c
++++ b/drivers/ps2/gs-dev.c
+@@ -42,6 +42,8 @@
+ #include <uapi/linux/ps2gs.h>
+ 
+ #define PS2GS_VERSION		1
++/* The buffer taken at the start: the size the library asks for by default */
++#define PS2GS_RESERVED_BUFFER	(256 * 1024)
+ 
+ #define VIF1_STAT		0x10003c00
+ #define VIF1_FBRST		0x10003c10
+@@ -67,6 +69,12 @@
+ 	atomic_t vsync_count;
+ 	atomic_t users;
+ 	bool vsync_irq_ok;
++	/*
++	 * A buffer taken at the start, when memory is still in large pieces.
++	 * After a while of swapping, a 256 KiB piece is hard to find, and
++	 * the mmap() of a program failed with ENOMEM.
++	 */
++	struct page *reserved;
+ } ps2gs = {
+ 	.channel = {
+ 		[PS2GS_CHANNEL_GIF] = {
+@@ -89,6 +97,7 @@
+ struct ps2gs_file {
+ 	struct page *pages;
+ 	unsigned int order;
++	bool reserved;		/* pages is the buffer kept from the start */
+ 	void *virt;
+ 	size_t size;
+ 
+@@ -430,7 +439,7 @@
+ 		ps2gs_reset_all();
+ 	ps2gs_restore_display(f);
+ 
+-	if (f->pages)
++	if (f->pages && !f->reserved)
+ 		__free_pages(f->pages, f->order);
+ 	kfree(f);
+ 
+@@ -452,10 +461,18 @@
+ 	if (f->virt)
+ 		return -EBUSY;	/* One buffer for each open */
+ 
+-	order = get_order(size);
+-	pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+-	if (!pages)
+-		return -ENOMEM;
++	if (ps2gs.reserved && size <= PS2GS_RESERVED_BUFFER) {
++		order = get_order(PS2GS_RESERVED_BUFFER);
++		pages = ps2gs.reserved;
++		memset(page_address(pages), 0, PS2GS_RESERVED_BUFFER);
++		f->reserved = true;
++	} else {
++		order = get_order(size);
++		pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
++		if (!pages)
++			return -ENOMEM;
++		f->reserved = false;
++	}
+ 
+ 	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+ 	err = remap_pfn_range(vma, vma->vm_start, page_to_pfn(pages),
+@@ -579,6 +596,12 @@
+ 		goto err_misc;
+ 	}
+ 
++	ps2gs.reserved = alloc_pages(GFP_KERNEL | __GFP_ZERO,
++		get_order(PS2GS_RESERVED_BUFFER));
++	if (!ps2gs.reserved)
++		pr_warn("ps2gs: no %u KiB buffer at the start, each mmap() allocates\n",
++			PS2GS_RESERVED_BUFFER / 1024);
++
+ 	pr_info("ps2gs: device ready, buffers up to %u KiB\n",
+ 		PS2GS_MAX_BUFFER / 1024);
+ 
+@@ -599,6 +622,8 @@
+ 	int i;
+ 
+ 	misc_deregister(&ps2gs_miscdevice);
++	if (ps2gs.reserved)
++		__free_pages(ps2gs.reserved, get_order(PS2GS_RESERVED_BUFFER));
+ 	if (ps2gs.vsync_irq_ok)
+ 		free_irq(IRQ_GS_VSYNC, &ps2gs);
+ 	for (i = 0; i < ARRAY_SIZE(ps2gs.channel); i++)

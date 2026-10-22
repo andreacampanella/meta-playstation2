@@ -1,0 +1,30 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 12:10:00 +0100
+Subject: [PATCH] MIPS: R5900: sqrt.s reads its operand from ft
+
+On the R5900 the FPU takes the operand of SQRT.S from the ft field of
+the instruction, where every other MIPS uses fs (the EE Core
+Instruction Set Manual writes it "SQRT.S fd, ft"). The table had only
+the standard form, so "sqrt.s $f0, $f12" was encoded with $f12 in fs,
+and the hardware took the square root of $f0 instead. GCC emits
+sqrt.s for sqrtf() with -march=r5900, so every program with a square
+root in float got a wrong number.
+
+Add the R5900 form, with the standard one no longer for the R5900, so
+the disassembler shows the right register as well.
+
+Upstream-Status: Inappropriate [PlayStation 2 port; a candidate for upstream]
+---
+--- a/opcodes/mips-opc.c	2026-10-17 12:09:50.228649571 +0100
++++ b/opcodes/mips-opc.c	2026-10-17 12:09:50.242320262 +0100
+@@ -1945,7 +1945,9 @@
+ {"sqc2",		"+7,o(b)",	0xf8000000, 0xfc000000,	RD_3|RD_C2|SM,		0,		EE,		0,	0 },
+ {"sqc2",		"+7,A(b)",	0,    (int) M_SQC2_AB,	INSN_MACRO,		0,		EE,		0,	0 },
+ {"sqrt.d",		"D,S",		0x46200004, 0xffff003f, WR_1|RD_2|FP_D,		0,		I2,		0,	SF },
+-{"sqrt.s",		"D,S",		0x46000004, 0xffff003f, WR_1|RD_2|FP_S,		0,		I2,		0,	0 },
++/* The R5900 reads the operand of sqrt.s from the ft field, not fs.  */
++{"sqrt.s",		"D,T",		0x46000004, 0xffe0f83f, WR_1|RD_2|FP_S,		0,		EE,		0,	0 },
++{"sqrt.s",		"D,S",		0x46000004, 0xffff003f, WR_1|RD_2|FP_S,		0,		I2,		0,	EE },
+ {"sqrt.ps",		"D,S",		0x46c00004, 0xffff003f, WR_1|RD_2|FP_D,		0,		SB1,		0,	0 },
+ {"srav",		"d,t,s",	0x00000007, 0xfc0007ff,	WR_1|RD_2|RD_3,		0,		I1,		0,	0 },
+ {"sra",			"d,w,s",	0x00000007, 0xfc0007ff,	WR_1|RD_2|RD_3,		0,		I1,		0,	0 }, /* srav */

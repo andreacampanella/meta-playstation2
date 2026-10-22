@@ -1,0 +1,540 @@
+From 9b4fb3e050f57590f345786213b8b93d7d3fcb6d Mon Sep 17 00:00:00 2001
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Tue, 20 Oct 2026 19:39:15 +0100
+Subject: [PATCH] fbdev: ps2fb: Mapped pixels in RAM, sent to the GS with
+ deferred I/O
+
+The frame buffer is in the local memory of the GS, which the CPU cannot
+address, so the driver refused mmap. An X server with the fbdev driver,
+and any other program that draws into /dev/fb0, needs it.
+
+A program that maps /dev/fb0 now gets a buffer in RAM with the layout of
+the display buffer: line_length bytes a row, 16 or 32 bits a pixel in
+the GS formats PSMCT16 and PSMCT32, as the bit fields of the screen info
+say. Deferred I/O notes the pages that the program writes to, and at
+most 25 times a second the driver sends the rows of those pages to the
+display buffer with GIF image transfers, in the package buffer that the
+console uses.
+
+The buffer is allocated at the first mmap, for the video mode at that
+time, and freed after the last mapping goes away, so the console costs
+no RAM. While the buffer is mapped, a mode that needs a larger buffer is
+refused with -EBUSY. smem_len is now the size of the mapped pixels. The
+size check of the GS memory in check_var uses GS_MEMORY_SIZE.
+
+The read circuit takes the alpha of each pixel (PMODE.MMOD = 0), and a
+pixel with alpha 0 does not show: the screen stayed black. The console
+draws with alpha 0x80, and a program that maps the pixels usually leaves
+the alpha 0, so the upload sets it, 0x80 for PSMCT32 and the A bit for
+PSMCT16.
+
+The console draws into the GS directly and does not see the buffer. A
+program that maps the pixels takes the console to graphics mode first
+(KD_GRAPHICS), as an X server does.
+
+ps2fb.debug=1, also at run time in /sys/module/ps2fb/parameters/debug,
+logs the mappings and the uploads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MzD8VdhZHy98irH2xsDHF3
+
+Upstream-Status: Pending
+---
+ drivers/video/fbdev/Kconfig |   6 +-
+ drivers/video/fbdev/ps2fb.c | 373 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 370 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+index 6bea8addc..a89812be9 100644
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1991,11 +1991,13 @@ config FB_PS2
+ 	depends on FB && SONY_PS2
+ 	select PS2_GS
+ 	select FB_TILEBLITTING
++	select FB_DEFERRED_IO
+ 	default y
+ 	help
+ 	  Frame buffer driver for the Sony Playstation 2 Graphics Synthesizer.
+-	  Memory mapping is not supported since the frame buffer is local to
+-	  the GS.
++	  The frame buffer is local to the GS. A program that maps it gets
++	  the pixels in RAM, and the driver sends the written rows to the GS
++	  with deferred I/O.
+ 
+ config FB_PS3
+ 	tristate "PS3 GPU framebuffer driver"
+diff --git a/drivers/video/fbdev/ps2fb.c b/drivers/video/fbdev/ps2fb.c
+index 51b3e47f8..84320f394 100644
+--- a/drivers/video/fbdev/ps2fb.c
++++ b/drivers/video/fbdev/ps2fb.c
+@@ -44,6 +44,8 @@
+ #include <linux/of_device.h>
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++#include <linux/workqueue.h>
+ 
+ #include <asm/io.h>
+ 
+@@ -141,6 +143,15 @@ struct console_buffer {
+  * @package: tags and datafor the GIF
+  * @package.capacity: maximum number of GIF packages in 16-byte unit
+  * @package.buffer: DMA buffer for GIF packages
++ * @shadow: the pixels in RAM for a program that maps the frame buffer
++ * @shadow.info: the frame buffer of this structure
++ * @shadow.base: the buffer, or %NULL when nothing maps it
++ * @shadow.size: size of the buffer in bytes
++ * @shadow.maps: number of mappings of the buffer
++ * @shadow.all: send all rows at the next deferred I/O
++ * @shadow.lock: mutex for the allocation and the release of the buffer
++ * @shadow.free_work: releases the buffer after the last mapping
++ * @shadow.defio: deferred I/O of the mapped pages
+  */
+ struct ps2fb_par {
+ 	spinlock_t lock;
+@@ -155,8 +166,21 @@ struct ps2fb_par {
+ 		size_t capacity;
+ 		union package *buffer;
+ 	} package;
++
++	struct ps2fb_shadow {
++		struct fb_info *info;
++		void *base;
++		size_t size;
++		atomic_t maps;
++		bool all;
++		struct mutex lock;
++		struct work_struct free_work;
++		struct fb_deferred_io defio;
++	} shadow;
+ };
+ 
++static size_t shadow_size_for_var(const struct fb_var_screeninfo *var);
++
+ /**
+  * struct gs_sync_param - Graphics Synthesizer registers for video modes
+  * @smode1: SMODE1 register
+@@ -1671,16 +1695,16 @@ static int ps2fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
+         /* Check bits per pixel. */
+         if (!var->bits_per_pixel)
+ 		var->bits_per_pixel = default_bits_per_pixel(
+-		     var->xres_virtual, var->yres_virtual, info->fix.smem_len);
++		     var->xres_virtual, var->yres_virtual, GS_MEMORY_SIZE);
+ 	else if (var->bits_per_pixel != 16 &&
+ 		 var->bits_per_pixel != 32)
+ 		return -EINVAL;
+         if (!bits_per_pixel_fits(var->xres_virtual, var->yres_virtual,
+-			var->bits_per_pixel, info->fix.smem_len))
++			var->bits_per_pixel, GS_MEMORY_SIZE))
+ 		var->bits_per_pixel = default_bits_per_pixel(
+-		     var->xres_virtual, var->yres_virtual, info->fix.smem_len);
++		     var->xres_virtual, var->yres_virtual, GS_MEMORY_SIZE);
+         if (!bits_per_pixel_fits(var->xres_virtual, var->yres_virtual,
+-			var->bits_per_pixel, info->fix.smem_len))
++			var->bits_per_pixel, GS_MEMORY_SIZE))
+ 		return -ENOMEM;
+ 	if (var->bits_per_pixel == 16) {
+ 		var->red    = (struct fb_bitfield){ .offset =  0, .length = 5 };
+@@ -1713,6 +1737,11 @@ static int ps2fb_cb_check_var(
+ 	err = ps2fb_check_var(var, info);
+ 	spin_unlock_irqrestore(&par->lock, flags);
+ 
++	/* A program has the pixels mapped: the buffer cannot grow under it. */
++	if (!err && atomic_read(&par->shadow.maps) &&
++	    shadow_size_for_var(var) > par->shadow.size)
++		err = -EBUSY;
++
+ 	if (!err && info->tileops)
+ 		if (info->tileops->fb_get_tilemax(info) < 256)
+ 			err = -ENOMEM;
+@@ -2099,6 +2128,7 @@ static int ps2fb_set_par(struct fb_info *info)
+ 	info->fix.ypanstep = var->yres_virtual > var->yres ? 1 : 0;
+ 	info->fix.ywrapstep = 1;
+ 	info->fix.line_length = var->xres_virtual * var->bits_per_pixel / 8;
++	info->fix.smem_len = shadow_size_for_var(var);
+ 
+ 	gs_write_smode1(smode1);
+ 	gs_write_smode2(sp.smode2);
+@@ -2148,6 +2178,12 @@ static int ps2fb_cb_set_par(struct fb_info *info)
+ 		write_cb_pan_display(&info->var, info);
+ 
+ 		clear_screen(info);
++
++		/* The mode change cleared the screen: send the mapped pixels again. */
++		if (par->shadow.base && atomic_read(&par->shadow.maps)) {
++			par->shadow.all = true;
++			schedule_delayed_work(&info->deferred_work, 0);
++		}
+ 	}
+ 
+ 	spin_unlock_irqrestore(&par->lock, flags);
+@@ -2215,6 +2251,311 @@ static void fill_modes(struct device *dev, struct list_head *head)
+ 			dev_err(dev, "fb_add_videomode failed\n");
+ }
+ 
++
++/*
++ * Memory mapped pixels
++ *
++ * The frame buffer is in the local memory of the GS, which the CPU cannot
++ * address. A program that maps /dev/fb0 (an X server, for example) gets a
++ * buffer in RAM instead, with the layout of the display buffer: line_length
++ * bytes a row, 16 or 32 bits a pixel in the GS formats PSMCT16 and PSMCT32.
++ * Deferred I/O notes the pages the program writes to, and some time later
++ * the driver sends the rows of those pages to the display buffer with GIF
++ * image transfers.
++ *
++ * The buffer is allocated at the first mmap, for the video mode at that
++ * time, and freed when the last mapping goes away, so the console costs no
++ * RAM. While the buffer is mapped, a mode that needs a larger buffer is
++ * refused with -EBUSY.
++ *
++ * The console draws into the GS directly and does not see the buffer. A
++ * program that maps the pixels takes the console to graphics mode first
++ * (KD_GRAPHICS), as an X server does.
++ */
++
++/* About 25 uploads a second at most */
++#define SHADOW_DELAY (HZ / 25)
++
++/*
++ * ps2fb.debug=1, or 1 in /sys/module/ps2fb/parameters/debug: log the
++ * mappings and the uploads, all of the first 20 and then one in 100.
++ */
++static int shadow_debug;
++module_param_named(debug, shadow_debug, int, 0644);
++MODULE_PARM_DESC(debug, "Log the mapped pixel buffer and its uploads");
++
++static bool shadow_log(void)
++{
++	static unsigned long count;
++
++	return shadow_debug && (count++ < 20 || count % 100 == 0);
++}
++
++static size_t shadow_size_for_var(const struct fb_var_screeninfo *var)
++{
++	return PAGE_ALIGN((size_t)var->xres_virtual * var->bits_per_pixel / 8 *
++		var->yres_virtual);
++}
++
++/**
++ * shadow_copy_opaque - copy mapped pixels to the package buffer, opaque
++ * @dst: package buffer
++ * @src: mapped pixels
++ * @size: bytes, a multiple of 4
++ * @bits_per_pixel: 16 or 32
++ *
++ * The read circuit takes the alpha of each pixel (PMODE.MMOD = 0), and a
++ * pixel with alpha 0 does not show. The console draws with alpha 0x80, a
++ * program that maps the pixels usually leaves it 0. So the copy sets the
++ * alpha: 0x80 for PSMCT32, the A bit for PSMCT16.
++ */
++static void shadow_copy_opaque(void *dst, const void *src, size_t size,
++	u32 bits_per_pixel)
++{
++	const u32 *s = src;
++	u32 *d = dst;
++	size_t i;
++
++	if (bits_per_pixel == 16) {
++		for (i = 0; i < size / 4; i++)
++			d[i] = s[i] | 0x80008000;
++	} else {
++		for (i = 0; i < size / 4; i++)
++			d[i] = (s[i] & 0x00ffffff) | 0x80000000;
++	}
++}
++
++/**
++ * shadow_upload_rows - send rows of the mapped pixels to the display buffer
++ * @info: frame buffer info object
++ * @y0: first row
++ * @y1: row after the last row
++ *
++ * Each transfer fills the package buffer: the BITBLTBUF, TRXPOS, TRXREG and
++ * TRXDIR registers, then the rows as an IMAGE package.
++ */
++static void shadow_upload_rows(struct fb_info *info, u32 y0, u32 y1)
++{
++	struct ps2fb_par *par = info->par;
++	const struct fb_var_screeninfo *var = &info->var;
++	const u32 line = info->fix.line_length;
++	const u32 header = 6;	/* Two tags and four registers */
++	const u32 rows_max = line ?
++		(par->package.capacity - header) * sizeof(union package) / line : 0;
++	u32 y = y0;
++
++	/* An IMAGE package carries whole quadwords. */
++	if (!rows_max || line % sizeof(union package)) {
++		fb_warn_once(info, "upload: %u bytes a row cannot be sent\n", line);
++		return;
++	}
++
++	while (y < y1) {
++		union package * const base_package = par->package.buffer;
++		union package *package = base_package;
++		const u32 rows = min(rows_max, y1 - y);
++		const u32 nloop = rows * line / sizeof(union package);
++		unsigned long flags;
++
++		spin_lock_irqsave(&par->lock, flags);
++
++		if (!gif_wait()) {
++			spin_unlock_irqrestore(&par->lock, flags);
++			fb_warn_once(info, "upload: the GIF did not finish\n");
++			return;
++		}
++
++		GIF_PACKAGE_TAG(package) {
++			.flg = gif_packed_mode,
++			.reg0 = gif_reg_ad,
++			.nreg = 1,
++			.nloop = 4
++		};
++		GIF_PACKAGE_AD(package) {
++			.addr = gs_addr_bitbltbuf,
++			.data.bitbltbuf = {
++				.dpsm = var_to_psm(var, info),
++				.dbw = var_to_fbw(var),
++				.dbp = 0
++			}
++		};
++		GIF_PACKAGE_AD(package) {
++			.addr = gs_addr_trxpos,
++			.data.trxpos = {
++				.dsax = 0,
++				.dsay = y
++			}
++		};
++		GIF_PACKAGE_AD(package) {
++			.addr = gs_addr_trxreg,
++			.data.trxreg = {
++				.rrw = var->xres_virtual,
++				.rrh = rows
++			}
++		};
++		GIF_PACKAGE_AD(package) {
++			.addr = gs_addr_trxdir,
++			.data.trxdir = { .xdir = gs_trxdir_host_to_local }
++		};
++		GIF_PACKAGE_TAG(package) {
++			.flg = gif_image_mode,
++			.nloop = nloop,
++			.eop = 1
++		};
++
++		shadow_copy_opaque(package, par->shadow.base + (size_t)y * line,
++			(size_t)rows * line, var->bits_per_pixel);
++		package += nloop;
++
++		gif_write(&base_package->gif, package - base_package);
++
++		spin_unlock_irqrestore(&par->lock, flags);
++
++		y += rows;
++	}
++}
++
++/* The deferred I/O callback: the rows of the written pages */
++static void shadow_deferred_io(struct fb_info *info, struct list_head *pagelist)
++{
++	struct ps2fb_par *par = info->par;
++	const u32 line = info->fix.line_length;
++	const u32 rows = info->var.yres_virtual;
++	unsigned long first = ULONG_MAX, last = 0;
++	struct page *page;
++
++	if (!par->shadow.base || !line)
++		return;
++
++	if (par->shadow.all) {
++		par->shadow.all = false;
++		if (shadow_log())
++			fb_info(info, "upload of all %u rows\n", rows);
++		shadow_upload_rows(info, 0, rows);
++		return;
++	}
++
++	list_for_each_entry(page, pagelist, lru) {
++		first = min(first, page->index);
++		last = max(last, page->index);
++	}
++	if (first > last)
++		return;
++
++	if (shadow_log())
++		fb_info(info, "upload of pages %lu to %lu, rows %lu to %lu\n",
++			first, last, (first << PAGE_SHIFT) / line,
++			min_t(unsigned long, DIV_ROUND_UP((last + 1) << PAGE_SHIFT, line), rows));
++
++	shadow_upload_rows(info, (first << PAGE_SHIFT) / line,
++		min_t(u32, DIV_ROUND_UP((last + 1) << PAGE_SHIFT, line), rows));
++}
++
++/* Free the buffer. The caller holds shadow.lock, and nothing maps it. */
++static void shadow_free(struct fb_info *info)
++{
++	struct ps2fb_par *par = info->par;
++	size_t offset;
++
++	if (!par->shadow.base)
++		return;
++
++	cancel_delayed_work_sync(&info->deferred_work);
++
++	/* The fault handler gave the pages a mapping: take it back before vfree. */
++	for (offset = 0; offset < par->shadow.size; offset += PAGE_SIZE)
++		vmalloc_to_page(par->shadow.base + offset)->mapping = NULL;
++
++	vfree(par->shadow.base);
++	par->shadow.base = NULL;
++	par->shadow.size = 0;
++	info->screen_base = NULL;
++	info->screen_size = 0;
++}
++
++/*
++ * After the last mapping went away: send what is still pending, then give
++ * the RAM back. A work item, because vm_ops close must not wait for the
++ * deferred I/O work.
++ */
++static void shadow_free_work(struct work_struct *work)
++{
++	struct ps2fb_par *par = container_of(work, struct ps2fb_par,
++		shadow.free_work);
++	struct fb_info *info = par->shadow.info;
++
++	mutex_lock(&par->shadow.lock);
++	if (!atomic_read(&par->shadow.maps)) {
++		flush_delayed_work(&info->deferred_work);
++		shadow_free(info);
++	}
++	mutex_unlock(&par->shadow.lock);
++}
++
++static struct vm_operations_struct shadow_vm_ops;
++
++static void shadow_vm_open(struct vm_area_struct *vma)
++{
++	struct fb_info *info = vma->vm_private_data;
++	struct ps2fb_par *par = info->par;
++
++	atomic_inc(&par->shadow.maps);
++}
++
++static void shadow_vm_close(struct vm_area_struct *vma)
++{
++	struct fb_info *info = vma->vm_private_data;
++	struct ps2fb_par *par = info->par;
++
++	if (atomic_dec_and_test(&par->shadow.maps))
++		schedule_work(&par->shadow.free_work);
++}
++
++static int ps2fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
++{
++	struct ps2fb_par *par = info->par;
++	const size_t size = shadow_size_for_var(&info->var);
++	int err;
++
++	mutex_lock(&par->shadow.lock);
++
++	/* A buffer of an earlier mode, not mapped any more */
++	if (par->shadow.base && !atomic_read(&par->shadow.maps) &&
++	    par->shadow.size != size)
++		shadow_free(info);
++
++	if (!par->shadow.base) {
++		par->shadow.base = vzalloc(size);
++		if (!par->shadow.base) {
++			mutex_unlock(&par->shadow.lock);
++			return -ENOMEM;
++		}
++		par->shadow.size = size;
++		info->screen_base = (char __iomem *)par->shadow.base;
++		info->screen_size = size;
++	}
++
++	err = fb_deferred_io_mmap(info, vma);
++	if (!err) {
++		if (!shadow_vm_ops.fault) {
++			shadow_vm_ops = *vma->vm_ops;
++			shadow_vm_ops.open = shadow_vm_open;
++			shadow_vm_ops.close = shadow_vm_close;
++		}
++		vma->vm_ops = &shadow_vm_ops;
++		atomic_inc(&par->shadow.maps);
++		/* The program sees what the screen shows: none of it yet */
++		par->shadow.all = true;
++		if (shadow_debug)
++			fb_info(info, "mmap: %zu bytes, %d mappings\n",
++				par->shadow.size, atomic_read(&par->shadow.maps));
++	}
++
++	mutex_unlock(&par->shadow.lock);
++
++	return err;
++}
++
+ static int init_console_buffer(struct platform_device *pdev,
+ 	struct fb_info *info)
+ {
+@@ -2241,10 +2582,11 @@ static int init_console_buffer(struct platform_device *pdev,
+ 	fb_info(info, "Graphics Synthesizer console frame buffer device\n");
+ 
+ 	info->screen_size = 0;
+-	info->screen_base = NULL;	/* mmap is unsupported by hardware */
++	/* The mapped pixels: allocated at the first mmap (ps2fb_mmap) */
++	info->screen_base = NULL;
+ 
+ 	info->fix.smem_start = 0;	/* GS frame buffer is local memory */
+-	info->fix.smem_len = GS_MEMORY_SIZE;
++	info->fix.smem_len = 0;		/* The size of the mapped pixels: set_par */
+ 
+ 	info->fbops = &fbops;
+ 	info->flags = FBINFO_DEFAULT |
+@@ -2255,7 +2597,8 @@ static int init_console_buffer(struct platform_device *pdev,
+ 		      FBINFO_HWACCEL_YPAN |
+ 		      FBINFO_HWACCEL_YWRAP |
+ 		      FBINFO_PARTIAL_PAN_OK |
+-		      FBINFO_READS_FAST;
++		      FBINFO_READS_FAST |
++		      FBINFO_VIRTFB;	/* The mapped pixels are in RAM */
+ 
+ 	info->flags |= FBINFO_MISC_TILEBLITTING;
+ 	info->tileops = &tileops;
+@@ -2309,6 +2652,15 @@ static int ps2fb_probe(struct platform_device *pdev)
+ 	if (err < 0)
+ 		goto err_init_buffer;
+ 
++	par->shadow.info = info;
++	mutex_init(&par->shadow.lock);
++	INIT_WORK(&par->shadow.free_work, shadow_free_work);
++	par->shadow.defio.delay = SHADOW_DELAY;
++	par->shadow.defio.deferred_io = shadow_deferred_io;
++	info->fbdefio = &par->shadow.defio;
++	fb_deferred_io_init(info);
++	info->fbops->fb_mmap = ps2fb_mmap;	/* In place of fb_deferred_io_mmap */
++
+ 	fb_info(info, "Mode option is \"%s\"\n", mode_option);
+ 
+ 	info->var = (struct fb_var_screeninfo) { };
+@@ -2371,6 +2723,13 @@ static int ps2fb_remove(struct platform_device *pdev)
+ 		unregister_framebuffer(info);
+ 		fb_dealloc_cmap(&info->cmap);
+ 
++		cancel_work_sync(&par->shadow.free_work);
++		mutex_lock(&par->shadow.lock);
++		shadow_free(info);
++		mutex_unlock(&par->shadow.lock);
++		info->fix.smem_len = 0;	/* No pages for the cleanup to visit */
++		fb_deferred_io_cleanup(info);
++
+ 		framebuffer_release(info);
+ 	}
+ 
+-- 
+2.43.0
+

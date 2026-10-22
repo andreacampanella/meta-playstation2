@@ -1,0 +1,153 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Fri, 17 Oct 2026 10:00:00 +0100
+Subject: [PATCH] ps2gs: Receive a local-to-host transfer
+
+A program can only send to the GS through /dev/ps2gs. Add the other
+direction, so a program can read the frame buffer back: glReadPixels,
+screenshots, and the test scenes of the library on the console.
+
+The program sends the transfer registers itself (BITBLTBUF, TRXPOS,
+TRXREG and TRXDIR = 1) with PS2GS_IOC_SEND. Then PS2GS_IOC_RECEIVE
+reads the pixels into the packet buffer: the driver waits until the GIF,
+VIF1 and VU1 are idle, sets the VIF1 FIFO direction to memory, sets the
+GS bus direction to local-to-host, runs the VIF1 channel in normal mode
+to memory, and puts both back. The data lands at the offset in the
+packet buffer, qwc quadwords of it.
+
+PS2GS_VERSION is 2. A library that finds version 1 returns zeros from
+glReadPixels.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+--- a/drivers/ps2/gs-dev.c
++++ b/drivers/ps2/gs-dev.c
+@@ -41,13 +41,14 @@
+ 
+ #include <uapi/linux/ps2gs.h>
+ 
+-#define PS2GS_VERSION		1
++#define PS2GS_VERSION		2	/* 2: PS2GS_IOC_RECEIVE */
+ /* The buffer taken at the start: the size the library asks for by default */
+ #define PS2GS_RESERVED_BUFFER	(256 * 1024)
+ 
+ #define VIF1_STAT		0x10003c00
+ #define VIF1_FBRST		0x10003c10
+ #define VIF1_STAT_BUSY		0x1f00000f	/* FQC, VGW, VEW, VPS */
++#define VIF1_STAT_FDR		(1 << 23)	/* FIFO direction: VIF1 to memory */
+ 
+ #define PS2GS_DMA_TIMEOUT	(HZ)		/* One second for one packet */
+ #define PS2GS_VSYNC_TIMEOUT	(HZ / 10)	/* Two fields at 50 Hz */
+@@ -382,6 +383,67 @@
+ 	return err;
+ }
+ 
++/*
++ * Local to host: the GS writes pixels into the buffer. The program has
++ * sent the transfer setup (BITBLTBUF, TRXPOS, TRXREG, TRXDIR = 1), and
++ * the GS holds the pixels in its output FIFO. The bus turns around
++ * (BUSDIR), the VIF1 FIFO reverses (FDR), and the VIF1 channel runs
++ * toward memory. Nothing else may use the VIF1 path meanwhile.
++ */
++static int ps2gs_receive(struct ps2gs_file *f, const struct ps2gs_receive *r)
++{
++	struct ps2gs_channel *ch = &ps2gs.channel[PS2GS_CHANNEL_VIF1];
++	size_t len;
++	int err;
++
++	if (!f->virt)
++		return -ENXIO;
++	if (!r->qwc)
++		return 0;
++	if ((r->offset & 15) || r->qwc > PS2GS_QWC_MAX)
++		return -EINVAL;
++	len = (size_t)r->qwc * 16;
++	if (r->offset > f->size || len > f->size - r->offset)
++		return -EINVAL;
++
++	mutex_lock(&ps2gs.lock);
++
++	/* The setup packet must be through, and VU1 idle. */
++	err = channel_wait(&ps2gs.channel[PS2GS_CHANNEL_GIF]);
++	if (!err)
++		err = channel_wait(ch);
++	if (!err)
++		err = vu1_wait();
++	if (err)
++		goto out;
++
++	/* Clean lines of the area out of the cache: the DMA writes under it. */
++	dma_cache_wback_inv((unsigned long)f->virt + r->offset, len);
++
++	outl(VIF1_STAT_FDR, VIF1_STAT);
++	gs_writeq_busdir(1);
++
++	ch->done = false;
++	outl(virt_to_phys(f->virt + r->offset), ch->madr);
++	outl(r->qwc, ch->qwc);
++	wmb();
++	outl(DMAC_CHCR_DIR_TOMEM | DMAC_CHCR_MOD_NORMAL | DMAC_CHCR_STR_START,
++		ch->chcr);
++	err = channel_wait(ch);
++	if (err) {
++		pr_warn("ps2gs: receive DMA timeout, reset\n");
++		channel_reset(ch);
++	}
++
++	gs_writeq_busdir(0);
++	outl(0, VIF1_STAT);
++	dma_cache_inv((unsigned long)f->virt + r->offset, len);
++
++out:
++	mutex_unlock(&ps2gs.lock);
++	return err;
++}
++
+ static int ps2gs_wait(unsigned long flags)
+ {
+ 	int err = 0;
+@@ -495,6 +557,7 @@
+ 	struct ps2gs_file *f = file->private_data;
+ 	void __user *uarg = (void __user *)arg;
+ 	struct ps2gs_send s;
++	struct ps2gs_receive rcv;
+ 	struct ps2gs_reg r;
+ 	struct ps2gs_info info;
+ 	int err;
+@@ -532,6 +595,11 @@
+ 			return -EFAULT;
+ 		return ps2gs_set_reg(r.reg, r.value);
+ 
++	case PS2GS_IOC_RECEIVE:
++		if (copy_from_user(&rcv, uarg, sizeof(rcv)))
++			return -EFAULT;
++		return ps2gs_receive(f, &rcv);
++
+ 	case PS2GS_IOC_RESET:
+ 		ps2gs_reset_all();
+ 		return 0;
+--- a/include/uapi/linux/ps2gs.h
++++ b/include/uapi/linux/ps2gs.h
+@@ -54,6 +54,16 @@
+ 	__u64 value;
+ };
+ 
++/*
++ * PS2GS_IOC_RECEIVE: the GS writes qwc quadwords into the buffer at
++ * offset, after the program sent a transfer setup with TRXDIR = 1
++ * (local to host). Driver version 2 and later.
++ */
++struct ps2gs_receive {
++	__u32 offset;		/* Byte offset in the buffer, a multiple of 16 */
++	__u32 qwc;		/* Quadwords to receive */
++};
++
+ struct ps2gs_info {
+ 	__u32 version;		/* Driver version */
+ 	__u32 max_buffer;	/* Largest buffer for mmap(), in bytes */
+@@ -70,5 +80,6 @@
+ #define PS2GS_IOC_GET_REG	_IOWR(PS2GS_IOC_MAGIC, 4, struct ps2gs_reg)
+ #define PS2GS_IOC_SET_REG	_IOW(PS2GS_IOC_MAGIC, 5, struct ps2gs_reg)
+ #define PS2GS_IOC_RESET		_IO(PS2GS_IOC_MAGIC, 6)	/* Reset GIF and VIF1 */
++#define PS2GS_IOC_RECEIVE	_IOW(PS2GS_IOC_MAGIC, 7, struct ps2gs_receive)
+ 
+ #endif /* _UAPI_LINUX_PS2GS_H */

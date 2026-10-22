@@ -1,0 +1,987 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Subject: [PATCH] video: add the ps2linux driver for Linux on the PlayStation 2
+
+A window is a picture in RAM. To show it, the driver sends the picture to
+the Graphics Synthesizer as a texture and draws one textured rectangle that
+fills the screen. Input comes from the SDL evdev code.
+
+A window with the OpenGL flag uses libGL.so.1 (ps2gl). The driver loads the
+library, gives its functions to the program and calls its context functions.
+
+Upstream-Status: Inappropriate [needs the direct hardware access of the meta-playstation2 layer]
+
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -424,6 +424,7 @@
+ set_option(SDL_DIRECTFB            "Use DirectFB video driver" OFF)
+ dep_option(SDL_DIRECTFB_SHARED     "Dynamically load directfb support" ON "SDL_DIRECTFB" OFF)
+ set_option(SDL_DUMMYVIDEO          "Use dummy video driver" ON)
++set_option(SDL_PS2LINUX            "Use the video driver for Linux on the PlayStation 2" OFF)
+ dep_option(SDL_IBUS                "Enable IBus support" ON ${UNIX_SYS} OFF)
+ set_option(SDL_SYSTEM_ICONV        "Use iconv() from system-installed libraries" ${SDL_SYSTEM_ICONV_DEFAULT})
+ set_option(SDL_LIBICONV            "Prefer iconv() from libiconv, if available, over libc version" OFF)
+@@ -1246,6 +1247,17 @@
+ endif()
+ 
+ if(SDL_VIDEO)
++  if(SDL_PS2LINUX)
++    set(SDL_VIDEO_DRIVER_PS2LINUX 1)
++    file(GLOB VIDEO_PS2LINUX_SOURCES ${SDL2_SOURCE_DIR}/src/video/ps2linux/*.c)
++    list(APPEND SOURCE_FILES ${VIDEO_PS2LINUX_SOURCES})
++    set(HAVE_PS2LINUX TRUE)
++    set(HAVE_SDL_VIDEO TRUE)
++    # The driver gives OpenGL windows through libGL.so.1. SDL_config.h then
++    # says SDL_VIDEO_OPENGL, which programs test before they ask for one.
++    set(SDL_VIDEO_OPENGL 1)
++    set(HAVE_OPENGL TRUE)
++  endif()
+   if(SDL_DUMMYVIDEO)
+     set(SDL_VIDEO_DRIVER_DUMMY 1)
+     file(GLOB VIDEO_DUMMY_SOURCES ${SDL2_SOURCE_DIR}/src/video/dummy/*.c)
+diff --git a/include/SDL_config.h.cmake b/include/SDL_config.h.cmake
+--- a/include/SDL_config.h.cmake
++++ b/include/SDL_config.h.cmake
+@@ -409,6 +409,7 @@
+ #cmakedefine SDL_VIDEO_DRIVER_DIRECTFB @SDL_VIDEO_DRIVER_DIRECTFB@
+ #cmakedefine SDL_VIDEO_DRIVER_DIRECTFB_DYNAMIC @SDL_VIDEO_DRIVER_DIRECTFB_DYNAMIC@
+ #cmakedefine SDL_VIDEO_DRIVER_DUMMY @SDL_VIDEO_DRIVER_DUMMY@
++#cmakedefine SDL_VIDEO_DRIVER_PS2LINUX @SDL_VIDEO_DRIVER_PS2LINUX@
+ #cmakedefine SDL_VIDEO_DRIVER_OFFSCREEN @SDL_VIDEO_DRIVER_OFFSCREEN@
+ #cmakedefine SDL_VIDEO_DRIVER_WINDOWS @SDL_VIDEO_DRIVER_WINDOWS@
+ #cmakedefine SDL_VIDEO_DRIVER_WINRT @SDL_VIDEO_DRIVER_WINRT@
+diff --git a/src/video/SDL_sysvideo.h b/src/video/SDL_sysvideo.h
+--- a/src/video/SDL_sysvideo.h
++++ b/src/video/SDL_sysvideo.h
+@@ -474,6 +474,7 @@
+ extern VideoBootStrap KMSDRM_bootstrap;
+ extern VideoBootStrap KMSDRM_LEGACY_bootstrap;
+ extern VideoBootStrap DUMMY_bootstrap;
++extern VideoBootStrap PS2LINUX_bootstrap;
+ extern VideoBootStrap DUMMY_evdev_bootstrap;
+ extern VideoBootStrap Wayland_bootstrap;
+ extern VideoBootStrap NACL_bootstrap;
+diff --git a/src/video/SDL_video.c b/src/video/SDL_video.c
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -136,6 +136,9 @@
+ #ifdef SDL_VIDEO_DRIVER_NGAGE
+     &NGAGE_bootstrap,
+ #endif
++#ifdef SDL_VIDEO_DRIVER_PS2LINUX
++    &PS2LINUX_bootstrap,
++#endif
+ #ifdef SDL_VIDEO_DRIVER_OFFSCREEN
+     &OFFSCREEN_bootstrap,
+ #endif
+diff --git a/src/video/ps2linux/SDL_ps2linuxvideo.c b/src/video/ps2linux/SDL_ps2linuxvideo.c
+--- a/src/video/ps2linux/SDL_ps2linuxvideo.c
++++ b/src/video/ps2linux/SDL_ps2linuxvideo.c
+@@ -0,0 +1,906 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2024 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "../../SDL_internal.h"
++
++#ifdef SDL_VIDEO_DRIVER_PS2LINUX
++
++/*
++ * Video driver for Linux on the PlayStation 2.
++ *
++ * A window is a picture in RAM. To show it, the driver sends the picture to
++ * the Graphics Synthesizer (GS) as a texture. The GS then draws one textured
++ * rectangle that fills the screen, so the GS does the scaling.
++ *
++ * All data for the GS goes through the data memory of vector unit 1 (VU1):
++ * the CPU writes a packet there with 32-bit writes, and a 3-instruction VU1
++ * program sends it to the GS. A direct write to the GS needs 128-bit
++ * registers, and the kernel does not keep those when an interrupt occurs.
++ *
++ * The driver maps the hardware through /dev/mem. It puts the console in
++ * graphics mode, so the kernel does not draw text during the program.
++ * Keyboard and mouse come from the SDL evdev code.
++ *
++ * The GS scales each picture to the full screen, so a small window costs
++ * less CPU time and is not smaller on the screen. For that reason the
++ * desktop size, which "fullscreen desktop" windows get, is 320x240.
++ *
++ * Environment variables:
++ *   SDL_PS2LINUX_DESKTOP=640x480  desktop size. The default is 320x240.
++ *   SDL_PS2LINUX_FILTER=0         sharp pixels, in place of smooth scaling
++ *   SDL_PS2LINUX_VSYNC=0          do not wait for the vertical sync
++ *
++ * On other machines the driver has no hardware part. It then works only if
++ * SDL_VIDEODRIVER=ps2linux is set, and it shows nothing. That is for tests.
++ */
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/input.h>
++#include <linux/kd.h>
++
++#include "SDL_video.h"
++#include "SDL_hints.h"
++#include "../SDL_sysvideo.h"
++#include "../SDL_pixels_c.h"
++#include "../../events/SDL_events_c.h"
++
++#ifdef SDL_INPUT_LINUXEV
++#include "../../core/linux/SDL_evdev.h"
++#include "../../core/linux/SDL_evdev_capabilities.h"
++#include "SDL_loadso.h"
++#endif
++
++#define PS2LINUX_DRIVER_NAME "ps2linux"
++#define PS2LINUX_SURFACE     "_SDL_PS2LinuxSurface"
++
++/* Hardware addresses */
++#define GIF_CTRL   0x10003000
++#define GIF_STAT   0x10003020
++#define VIF1_STAT  0x10003c00
++#define VIF1_FBRST 0x10003c10
++#define VIF1_FIFO  0x10005000
++#define VU1_MICRO  0x11008000
++#define VU1_DATA   0x1100c000
++#define GS_CSR     0x12001000
++
++/* GS register addresses for the address + data format */
++#define GS_PRIM       0x00
++#define GS_RGBAQ      0x01
++#define GS_UV         0x03
++#define GS_XYZ2       0x05
++#define GS_TEX0_2     0x07
++#define GS_CLAMP_2    0x09
++#define GS_TEX1_2     0x15
++#define GS_XYOFFSET_2 0x19
++#define GS_TEXFLUSH   0x3f
++#define GS_SCISSOR_2  0x41
++#define GS_TEST_2     0x48
++#define GS_FRAME_2    0x4d
++#define GS_ZBUF_2     0x4f
++#define GS_BITBLTBUF  0x50
++#define GS_TRXPOS     0x51
++#define GS_TRXREG     0x52
++#define GS_TRXDIR     0x53
++
++/* The texture is in GS memory page 160, after the console and its font. */
++#define TEXTURE_BLOCK (160 * 32)
++
++/* The largest window. The texture for it has 1024 x 512 texels. */
++#define MAX_WIDTH  640
++#define MAX_HEIGHT 512
++
++/* VU1 data memory holds 1024 quadwords: one tag and the data of a packet. */
++#define CHUNK_QWORDS 1000
++
++/* Screen coordinates get this bias, and XYOFFSET takes it away again. */
++#define BIAS 1024
++
++/*
++ * VU1 program: send the packet at the start of the data memory to the GS.
++ * Each VU instruction is a pair: lower word first, upper word second.
++ */
++static const Uint32 vu_program[] = {
++    0x10040000, 0x000002ff, /* vi4 = 0: start of the packet */
++    0x800026fc, 0x000002ff, /* xgkick vi4 */
++    0x8000033c, 0x400002ff, /* end of program */
++    0x8000033c, 0x000002ff,
++};
++
++static struct
++{
++    int hardware; /* The GS and VU1 are mapped */
++    int memfd;
++    volatile Uint32 *vu; /* VU1 data memory, 16 KiB */
++    volatile Uint32 *gif_ctrl;
++    volatile Uint32 *gif_stat;
++    volatile Uint32 *vif1_stat;
++    volatile Uint32 *vif1_fbrst;
++    volatile Uint32 *csr;
++    volatile void *vif1_fifo;
++    int xres, yres, fbw, psm, yoffset;
++    int filter, vsync;
++    int tty, graphics_mode;
++} ps2 = { 0, -1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 576, 460, 9, 0, 0, 1, 1, -1, 0 };
++
++/* --- hardware access ---------------------------------------------------- */
++
++/* The compile test builds the hardware part on a workstation. */
++#if defined(__mips__) || defined(SDL_PS2LINUX_COMPILE_TEST)
++#define PS2LINUX_HARDWARE 1
++#endif
++
++#ifdef PS2LINUX_HARDWARE
++
++static void *map_phys(Uint32 addr, size_t len)
++{
++    void *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED,
++                   ps2.memfd, (off_t)(addr & ~0xfffu));
++
++    return m == MAP_FAILED ? NULL : (char *)m + (addr & 0xfff);
++}
++
++static void write128(volatile void *dst, const Uint64 *src)
++{
++#ifdef __mips__
++    __asm__ volatile(
++        ".set push\n"
++        ".set arch=r5900\n"
++        "lq $8, 0(%[src])\n"
++        "sq $8, 0(%[dst])\n"
++        ".set pop\n"
++        :
++        : [src] "r"(src), [dst] "r"(dst)
++        : "$8", "memory");
++#else
++    (void)dst;
++    (void)src;
++#endif
++}
++
++static int read_ints(const char *path, const char *format, int *a, int *b)
++{
++    FILE *f = fopen(path, "r");
++    int n;
++
++    if (!f) {
++        return -1;
++    }
++    n = fscanf(f, format, a, b);
++    fclose(f);
++    return n;
++}
++
++/* VU1 runs, the VIF1 has work, or a transfer to the GS is in progress. */
++static int vu_busy(void)
++{
++    return (*ps2.vif1_stat & 0x0f00000f) != 0 ||
++           ((*ps2.gif_stat >> 10) & 3) != 0 ||
++           ((*ps2.gif_stat >> 24) & 0x1f) != 0;
++}
++
++/*
++ * Start the VU1 program and wait for the end of the transfer to the GS.
++ *
++ * The start code goes to the VIF1 with one 128-bit write. If an interrupt
++ * damages that write, only the low 32 bits arrive. Those bits hold the start
++ * code, and the wait code in the next 32 bits is lost. So do not rely on the
++ * wait code: look for the start of the work, then for its end.
++ */
++static void vu_kick(void)
++{
++    /* VIF1 codes: MSCAL at address 0, then FLUSH */
++    static const Uint64 code[2] __attribute__((aligned(16))) = {
++        0x1100000014000000ull, 0
++    };
++    int tries;
++
++    write128(ps2.vif1_fifo, code);
++    for (tries = 0; tries < 64 && !vu_busy(); tries++) {
++    }
++    for (tries = 0; tries < 2000000 && vu_busy(); tries++) {
++    }
++}
++
++/* Write one address + data quadword to VU1 data memory. */
++static void vu_ad(unsigned q, unsigned addr, Uint64 data)
++{
++    volatile Uint32 *p = &ps2.vu[4 * q];
++
++    p[0] = (Uint32)data;
++    p[1] = (Uint32)(data >> 32);
++    p[2] = addr;
++    p[3] = 0;
++}
++
++static void vu_tag(unsigned q, Uint64 lo, Uint32 regs)
++{
++    volatile Uint32 *p = &ps2.vu[4 * q];
++
++    p[0] = (Uint32)lo;
++    p[1] = (Uint32)(lo >> 32);
++    p[2] = regs;
++    p[3] = 0;
++}
++
++static void wait_field(void)
++{
++    const Uint32 field = *ps2.csr & (1u << 13);
++    int tries;
++
++    for (tries = 0; tries < 4000000; tries++) {
++        if ((*ps2.csr & (1u << 13)) != field) {
++            return;
++        }
++    }
++}
++
++/* Copy the picture from RAM to the texture area of the GS. */
++static void upload_surface(const SDL_Surface *surface)
++{
++    const int w = surface->w, h = surface->h;
++    const unsigned total = ((unsigned)w * h + 3) / 4;
++    const unsigned tbw = (w + 63) / 64;
++    unsigned done, x = 0, y = 0;
++    const Uint32 *row = (const Uint32 *)surface->pixels;
++
++    /* Destination area of the transfer */
++    vu_tag(0, 4ull | (1ull << 15) | (1ull << 60), 0xe);
++    vu_ad(1, GS_BITBLTBUF, ((Uint64)TEXTURE_BLOCK << 32) | ((Uint64)tbw << 48));
++    vu_ad(2, GS_TRXPOS, 0);
++    vu_ad(3, GS_TRXREG, (Uint64)w | ((Uint64)h << 32));
++    vu_ad(4, GS_TRXDIR, 0);
++    vu_kick();
++
++    /* The picture data, in packets that fit in the VU1 data memory */
++    for (done = 0; done < total; done += CHUNK_QWORDS) {
++        const unsigned n = total - done < CHUNK_QWORDS ? total - done : CHUNK_QWORDS;
++        volatile Uint32 *dst = &ps2.vu[4];
++        unsigned i;
++
++        /* Image data tag: n quadwords, end of packet */
++        vu_tag(0, (Uint64)n | (1ull << 15) | (2ull << 58), 0);
++
++        for (i = 0; i < 4 * n; i++) {
++            dst[i] = y < (unsigned)h ? row[x] : 0;
++            if (++x == (unsigned)w) {
++                x = 0;
++                y++;
++                row = (const Uint32 *)((const Uint8 *)row + surface->pitch);
++            }
++        }
++        vu_kick();
++    }
++}
++
++static int log2_ceil(int n)
++{
++    int k = 0;
++
++    while ((1 << k) < n) {
++        k++;
++    }
++    return k;
++}
++
++/*
++ * Draw the texture on the full screen.
++ *
++ * The console scrolls with a display offset: screen line s shows buffer line
++ * (s + yoffset) % yres. A picture that crosses the end of the buffer needs
++ * two passes with different offsets.
++ */
++static void draw_surface(const SDL_Surface *surface)
++{
++    const int w = surface->w, h = surface->h;
++    const unsigned tbw = (w + 63) / 64;
++    const int yo = ((ps2.yoffset % ps2.yres) + ps2.yres) % ps2.yres;
++    const int shift[2] = { yo, yo - ps2.yres };
++    const int passes = yo ? 2 : 1;
++    int p;
++
++    for (p = 0; p < passes; p++) {
++        int y0 = shift[p], y1 = ps2.yres - 1 + shift[p];
++        unsigned q = 1;
++
++        if (y0 < 0) {
++            y0 = 0;
++        }
++        if (y1 > ps2.yres - 1) {
++            y1 = ps2.yres - 1;
++        }
++
++        vu_ad(q++, GS_FRAME_2, ((Uint64)ps2.fbw << 16) | ((Uint64)ps2.psm << 24));
++        vu_ad(q++, GS_ZBUF_2, 1ull << 32); /* No depth writes */
++        vu_ad(q++, GS_XYOFFSET_2, (Uint64)(BIAS << 4) |
++                                      ((Uint64)((BIAS - shift[p]) << 4) << 32));
++        vu_ad(q++, GS_SCISSOR_2, ((Uint64)(ps2.xres - 1) << 16) |
++                                     ((Uint64)y0 << 32) | ((Uint64)y1 << 48));
++        vu_ad(q++, GS_TEST_2, (1ull << 16) | (1ull << 17));
++
++        /* Texture: 32-bit color. The color replaces the pixel. */
++        vu_ad(q++, GS_TEX0_2, (Uint64)TEXTURE_BLOCK | ((Uint64)tbw << 14) |
++                                  ((Uint64)log2_ceil(w) << 26) |
++                                  ((Uint64)log2_ceil(h) << 30) | (1ull << 35));
++        vu_ad(q++, GS_TEX1_2, 1 | (ps2.filter ? (1 << 5) | (1 << 6) : 0));
++        /* Do not read texels outside the picture. */
++        vu_ad(q++, GS_CLAMP_2, 2 | (2 << 2) | ((Uint64)(w - 1) << 14) |
++                                   ((Uint64)(h - 1) << 34));
++        vu_ad(q++, GS_TEXFLUSH, 0);
++
++        /* Sprite with texture, texel coordinates, context 2 */
++        vu_ad(q++, GS_PRIM, 6 | (1 << 4) | (1 << 8) | (1 << 9));
++        vu_ad(q++, GS_RGBAQ, 0x80808080ull | (0x3f800000ull << 32));
++        vu_ad(q++, GS_UV, 8 | (8 << 16));
++        vu_ad(q++, GS_XYZ2, (Uint64)(BIAS << 4) | ((Uint64)(BIAS << 4) << 16));
++        vu_ad(q++, GS_UV, (Uint64)((w << 4) - 8) | ((Uint64)((h << 4) - 8) << 16));
++        vu_ad(q++, GS_XYZ2, (Uint64)((BIAS + ps2.xres) << 4) |
++                                ((Uint64)((BIAS + ps2.yres) << 4) << 16));
++
++        vu_tag(0, (Uint64)(q - 1) | (1ull << 15) | (1ull << 60), 0xe);
++        vu_kick();
++    }
++}
++
++static int hardware_open(void)
++{
++    volatile Uint32 *micro;
++    const char *s;
++    int bpp = 32, unused = 0, xo = 0;
++    unsigned i;
++
++    ps2.memfd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
++    if (ps2.memfd < 0) {
++        return SDL_SetError("ps2linux: cannot open /dev/mem: %s", strerror(errno));
++    }
++
++    read_ints("/sys/class/graphics/fb0/virtual_size", "%d,%d", &ps2.xres, &ps2.yres);
++    read_ints("/sys/class/graphics/fb0/bits_per_pixel", "%d", &bpp, &unused);
++    if (read_ints("/sys/class/graphics/fb0/pan", "%d,%d", &xo, &ps2.yoffset) != 2) {
++        ps2.yoffset = 0;
++    }
++    ps2.fbw = (ps2.xres + 63) / 64;
++    ps2.psm = bpp == 32 ? 0x00 : 0x02;
++
++    micro = map_phys(VU1_MICRO, 0x1000);
++    ps2.vu = map_phys(VU1_DATA, 0x4000);
++    ps2.gif_ctrl = map_phys(GIF_CTRL, 0x1000);
++    ps2.vif1_stat = map_phys(VIF1_STAT, 0x1000);
++    ps2.vif1_fifo = map_phys(VIF1_FIFO, 0x1000);
++    ps2.csr = map_phys(GS_CSR, 0x1000);
++    if (!micro || !ps2.vu || !ps2.gif_ctrl || !ps2.vif1_stat ||
++        !ps2.vif1_fifo || !ps2.csr) {
++        close(ps2.memfd);
++        ps2.memfd = -1;
++        return SDL_SetError("ps2linux: cannot map the hardware");
++    }
++    /* These registers are in the same pages. */
++    ps2.gif_stat = (volatile Uint32 *)((volatile char *)ps2.gif_ctrl + (GIF_STAT - GIF_CTRL));
++    ps2.vif1_fbrst = (volatile Uint32 *)((volatile char *)ps2.vif1_stat + (VIF1_FBRST - VIF1_STAT));
++
++    *ps2.vif1_fbrst = 1;
++    usleep(1000);
++    for (i = 0; i < SDL_arraysize(vu_program); i++) {
++        micro[i] = vu_program[i];
++    }
++
++    s = SDL_getenv("SDL_PS2LINUX_FILTER");
++    ps2.filter = !s || SDL_atoi(s) != 0;
++    s = SDL_getenv("SDL_PS2LINUX_VSYNC");
++    ps2.vsync = !s || SDL_atoi(s) != 0;
++
++    /* Graphics mode stops the text and the cursor of the console. */
++    ps2.tty = open("/dev/tty0", O_RDWR | O_CLOEXEC);
++    if (ps2.tty >= 0 && ioctl(ps2.tty, KDSETMODE, KD_GRAPHICS) == 0) {
++        ps2.graphics_mode = 1;
++    }
++
++    ps2.hardware = 1;
++    return 0;
++}
++
++/* Async-signal-safe: only memory writes and ioctl. */
++static void hardware_close(void)
++{
++    int i;
++
++    if (!ps2.hardware) {
++        return;
++    }
++    ps2.hardware = 0;
++
++    /*
++     * If the program stops in the middle of a transfer, the GS waits for
++     * the remaining data and reads the next console text as picture data.
++     * A reset of the VIF1 and the GIF puts both back in the idle state.
++     */
++    for (i = 0; i < 100000 && vu_busy(); i++) {
++    }
++    *ps2.vif1_fbrst = 1;
++    *ps2.gif_ctrl = 1;
++
++    /* The kernel draws the text again when the mode goes to text. */
++    if (ps2.graphics_mode) {
++        ioctl(ps2.tty, KDSETMODE, KD_TEXT);
++        ps2.graphics_mode = 0;
++    }
++}
++
++static void on_fatal_signal(int sig)
++{
++    hardware_close();
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++
++static void hardware_present(const SDL_Surface *surface)
++{
++    upload_surface(surface);
++    if (ps2.vsync) {
++        wait_field();
++    }
++    draw_surface(surface);
++}
++
++#else /* No hardware part on other machines */
++
++static int hardware_open(void)
++{
++    return 0;
++}
++
++static void hardware_close(void)
++{
++}
++
++static void hardware_present(const SDL_Surface *surface)
++{
++    (void)surface;
++    (void)vu_program;
++}
++
++#endif /* PS2LINUX_HARDWARE */
++
++/* --- keyboard and mouse --------------------------------------------------- */
++
++#ifdef SDL_INPUT_LINUXEV
++
++#define TEST_BIT(bit, array) (((array)[(bit) / (8 * sizeof(unsigned long))] >> ((bit) % (8 * sizeof(unsigned long)))) & 1)
++
++/*
++ * SDL finds input devices with udev. Without udev it reads a device list
++ * from the environment variable SDL_EVDEV_DEVICES. Make that list here.
++ */
++static void find_input_devices(void)
++{
++    char list[512];
++    size_t used = 0;
++    int i;
++
++    if (SDL_getenv("SDL_EVDEV_DEVICES")) {
++        return;
++    }
++
++    list[0] = '\0';
++    for (i = 0; i < 16; i++) {
++        unsigned long keybit[(KEY_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long))] = { 0 };
++        unsigned long relbit[(REL_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long))] = { 0 };
++        char path[32];
++        int fd, cls = 0;
++
++        (void)SDL_snprintf(path, sizeof(path), "/dev/input/event%d", i);
++        fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++        if (fd < 0) {
++            continue;
++        }
++        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit) >= 0 &&
++            TEST_BIT(KEY_ENTER, keybit) && TEST_BIT(KEY_A, keybit)) {
++            cls |= SDL_UDEV_DEVICE_KEYBOARD;
++        }
++        if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relbit)), relbit) >= 0 &&
++            TEST_BIT(REL_X, relbit) && TEST_BIT(REL_Y, relbit)) {
++            cls |= SDL_UDEV_DEVICE_MOUSE;
++        }
++        close(fd);
++
++        if (cls && used + SDL_strlen(path) + 8 < sizeof(list)) {
++            used += SDL_snprintf(list + used, sizeof(list) - used, "%s%d:%s",
++                                 used ? "," : "", cls, path);
++        }
++    }
++
++    if (used) {
++        SDL_setenv("SDL_EVDEV_DEVICES", list, 1);
++    }
++}
++
++#endif /* SDL_INPUT_LINUXEV */
++
++static void PS2LINUX_PumpEvents(_THIS)
++{
++    (void)_this;
++#ifdef SDL_INPUT_LINUXEV
++    SDL_EVDEV_Poll();
++#endif
++}
++
++/* --- window frame buffer -------------------------------------------------- */
++
++static void PS2LINUX_DestroyWindowFramebuffer(_THIS, SDL_Window *window)
++{
++    SDL_Surface *surface;
++
++    (void)_this;
++    surface = (SDL_Surface *)SDL_SetWindowData(window, PS2LINUX_SURFACE, NULL);
++    SDL_FreeSurface(surface);
++}
++
++static int PS2LINUX_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format, void **pixels, int *pitch)
++{
++    /* Red is in the low byte, as in the 32-bit pixel format of the GS. */
++    const Uint32 surface_format = SDL_PIXELFORMAT_XBGR8888;
++    SDL_Surface *surface;
++    int w, h;
++
++    PS2LINUX_DestroyWindowFramebuffer(_this, window);
++
++    SDL_GetWindowSizeInPixels(window, &w, &h);
++    if (w > MAX_WIDTH || h > MAX_HEIGHT) {
++        return SDL_SetError("ps2linux: a %dx%d window is too large, the limit is %dx%d",
++                            w, h, MAX_WIDTH, MAX_HEIGHT);
++    }
++
++    surface = SDL_CreateRGBSurfaceWithFormat(0, w, h, 0, surface_format);
++    if (!surface) {
++        return -1;
++    }
++
++    SDL_SetWindowData(window, PS2LINUX_SURFACE, surface);
++    *format = surface_format;
++    *pixels = surface->pixels;
++    *pitch = surface->pitch;
++    return 0;
++}
++
++static int PS2LINUX_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL_Rect *rects, int numrects)
++{
++    SDL_Surface *surface;
++
++    (void)_this;
++    (void)rects;
++    (void)numrects;
++
++    surface = (SDL_Surface *)SDL_GetWindowData(window, PS2LINUX_SURFACE);
++    if (!surface) {
++        return SDL_SetError("ps2linux: no surface for the window");
++    }
++
++    if (ps2.hardware) {
++        hardware_present(surface);
++    }
++    return 0;
++}
++
++/* --- OpenGL through libGL.so.1 (ps2gl) ----------------------------------- */
++
++/*
++ * The OpenGL library of the console, ps2gl, draws with the GS and VU1 through
++ * /dev/ps2gs. The driver loads it, gives its functions to the program, and
++ * calls its context functions. A program with an OpenGL window does not use
++ * the window surface of this driver.
++ */
++
++struct ps2linux_gl
++{
++    int (*create_context)(int width, int height);
++    void (*destroy_context)(void);
++    void (*swap_buffers)(void);
++    int (*get_width)(void);
++    int (*get_height)(void);
++    SDL_Window *window;
++};
++
++static struct ps2linux_gl ps2gl;
++
++/*
++ * A program may have the library inside (a profiling build links libGL.a
++ * and exports its symbols). Then the driver must use that copy: a second
++ * copy from libGL.so.1 would own the display while the program draws into
++ * the first, and the screen would stay black. The program's own handle
++ * (dlopen of NULL) finds the symbols when the program exports them.
++ */
++static int PS2LINUX_GL_LoadLibrary(_THIS, const char *path)
++{
++    void *handle;
++
++    if (!path) {
++        path = SDL_getenv("SDL_VIDEO_GL_DRIVER");
++    }
++    if (!path) {
++        handle = dlopen(NULL, RTLD_NOW);
++        if (handle && dlsym(handle, "ps2glCreateContext")) {
++            path = "(the program)";
++        } else {
++            if (handle) {
++                dlclose(handle);
++            }
++            handle = NULL;
++            path = "libGL.so.1";
++        }
++    }
++    if (!handle) {
++        handle = SDL_LoadObject(path);
++    }
++    if (!handle) {
++        return -1;
++    }
++    _this->gl_config.dll_handle = handle;
++    SDL_strlcpy(_this->gl_config.driver_path, path, sizeof(_this->gl_config.driver_path));
++
++    ps2gl.create_context = (int (*)(int, int))SDL_LoadFunction(handle, "ps2glCreateContext");
++    ps2gl.destroy_context = (void (*)(void))SDL_LoadFunction(handle, "ps2glDestroyContext");
++    ps2gl.swap_buffers = (void (*)(void))SDL_LoadFunction(handle, "ps2glSwapBuffers");
++    ps2gl.get_width = (int (*)(void))SDL_LoadFunction(handle, "ps2glWidth");
++    ps2gl.get_height = (int (*)(void))SDL_LoadFunction(handle, "ps2glHeight");
++    if (!ps2gl.create_context || !ps2gl.destroy_context || !ps2gl.swap_buffers) {
++        SDL_UnloadObject(handle);
++        _this->gl_config.dll_handle = NULL;
++        return SDL_SetError("ps2linux: %s is not the ps2gl OpenGL library", path);
++    }
++    return 0;
++}
++
++static void *PS2LINUX_GL_GetProcAddress(_THIS, const char *proc)
++{
++    if (!_this->gl_config.dll_handle) {
++        return NULL;
++    }
++    return SDL_LoadFunction(_this->gl_config.dll_handle, proc);
++}
++
++static void PS2LINUX_GL_UnloadLibrary(_THIS)
++{
++    if (_this->gl_config.dll_handle) {
++        SDL_UnloadObject(_this->gl_config.dll_handle);
++        _this->gl_config.dll_handle = NULL;
++    }
++    SDL_zero(ps2gl);
++}
++
++static SDL_GLContext PS2LINUX_GL_CreateContext(_THIS, SDL_Window *window)
++{
++    int w, h;
++
++    (void)_this;
++    if (ps2gl.window) {
++        SDL_SetError("ps2linux: one OpenGL context at a time");
++        return NULL;
++    }
++    SDL_GetWindowSizeInPixels(window, &w, &h);
++    if (ps2gl.create_context(w, h) < 0) {
++        SDL_SetError("ps2linux: ps2gl cannot open a %dx%d context", w, h);
++        return NULL;
++    }
++    ps2gl.window = window;
++    return (SDL_GLContext)&ps2gl;
++}
++
++static int PS2LINUX_GL_MakeCurrent(_THIS, SDL_Window *window, SDL_GLContext context)
++{
++    (void)_this;
++    (void)window;
++    (void)context;
++    return 0;
++}
++
++static void PS2LINUX_GL_GetDrawableSize(_THIS, SDL_Window *window, int *w, int *h)
++{
++    (void)_this;
++    if (ps2gl.window == window && ps2gl.get_width && ps2gl.get_height) {
++        *w = ps2gl.get_width();
++        *h = ps2gl.get_height();
++    } else {
++        SDL_GetWindowSize(window, w, h);
++    }
++}
++
++static int PS2LINUX_GL_SetSwapInterval(_THIS, int interval)
++{
++    (void)_this;
++    (void)interval;
++    return 0;
++}
++
++static int PS2LINUX_GL_GetSwapInterval(_THIS)
++{
++    (void)_this;
++    return 1;
++}
++
++static int PS2LINUX_GL_SwapWindow(_THIS, SDL_Window *window)
++{
++    (void)_this;
++    (void)window;
++    if (ps2gl.swap_buffers) {
++        ps2gl.swap_buffers();
++    }
++    return 0;
++}
++
++static void PS2LINUX_GL_DeleteContext(_THIS, SDL_GLContext context)
++{
++    (void)_this;
++    (void)context;
++    if (ps2gl.window && ps2gl.destroy_context) {
++        ps2gl.destroy_context();
++    }
++    ps2gl.window = NULL;
++}
++
++/* --- video device --------------------------------------------------------- */
++
++static int PS2LINUX_SetDisplayMode(_THIS, SDL_VideoDisplay *display, SDL_DisplayMode *mode)
++{
++    (void)_this;
++    (void)display;
++    (void)mode;
++    return 0; /* The GS scales each picture to the screen. */
++}
++
++static int PS2LINUX_VideoInit(_THIS)
++{
++    static const struct
++    {
++        int w, h;
++    } sizes[] = {
++        { 640, 480 }, { 640, 400 }, { 512, 384 }, { 400, 300 }, { 320, 240 }, { 320, 200 }
++    };
++    const char *desktop = SDL_getenv("SDL_PS2LINUX_DESKTOP");
++    int desktop_w = 320, desktop_h = 240;
++    SDL_DisplayMode mode;
++    unsigned i;
++
++    if (desktop && (SDL_sscanf(desktop, "%dx%d", &desktop_w, &desktop_h) != 2 ||
++                    desktop_w < 64 || desktop_w > MAX_WIDTH ||
++                    desktop_h < 64 || desktop_h > MAX_HEIGHT)) {
++        desktop_w = 320;
++        desktop_h = 240;
++    }
++
++    if (hardware_open() < 0) {
++        return -1;
++    }
++#ifdef PS2LINUX_HARDWARE
++    {
++        static const int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
++
++        for (i = 0; i < SDL_arraysize(signals); i++) {
++            struct sigaction old;
++
++            /* Give the console back if the program stops with a fault. */
++            if (sigaction(signals[i], NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
++                signal(signals[i], on_fatal_signal);
++            }
++        }
++        atexit(hardware_close);
++    }
++#endif
++
++    /* The picture always fills the screen, which has 4:3. */
++    SDL_zero(mode);
++    mode.format = SDL_PIXELFORMAT_XBGR8888;
++    mode.refresh_rate = 50;
++    mode.w = desktop_w;
++    mode.h = desktop_h;
++    if (SDL_AddBasicVideoDisplay(&mode) < 0) {
++        return -1;
++    }
++    SDL_AddDisplayMode(&_this->displays[0], &mode);
++    for (i = 0; i < SDL_arraysize(sizes); i++) {
++        mode.w = sizes[i].w;
++        mode.h = sizes[i].h;
++        SDL_AddDisplayMode(&_this->displays[0], &mode);
++    }
++
++#ifdef SDL_INPUT_LINUXEV
++    find_input_devices();
++    SDL_EVDEV_Init();
++#endif
++
++    return 0;
++}
++
++static void PS2LINUX_VideoQuit(_THIS)
++{
++    (void)_this;
++#ifdef SDL_INPUT_LINUXEV
++    SDL_EVDEV_Quit();
++#endif
++    hardware_close();
++}
++
++static void PS2LINUX_DeleteDevice(SDL_VideoDevice *device)
++{
++    SDL_free(device);
++}
++
++static SDL_bool PS2LINUX_Available(void)
++{
++#ifdef PS2LINUX_HARDWARE
++    return access("/dev/mem", R_OK | W_OK) == 0 ? SDL_TRUE : SDL_FALSE;
++#else
++    const char *hint = SDL_GetHint(SDL_HINT_VIDEODRIVER);
++
++    return hint && SDL_strcmp(hint, PS2LINUX_DRIVER_NAME) == 0 ? SDL_TRUE : SDL_FALSE;
++#endif
++}
++
++static SDL_VideoDevice *PS2LINUX_CreateDevice(void)
++{
++    SDL_VideoDevice *device;
++
++    if (!PS2LINUX_Available()) {
++        return NULL;
++    }
++
++    device = (SDL_VideoDevice *)SDL_calloc(1, sizeof(SDL_VideoDevice));
++    if (!device) {
++        SDL_OutOfMemory();
++        return NULL;
++    }
++
++    device->VideoInit = PS2LINUX_VideoInit;
++    device->VideoQuit = PS2LINUX_VideoQuit;
++    device->SetDisplayMode = PS2LINUX_SetDisplayMode;
++    device->PumpEvents = PS2LINUX_PumpEvents;
++    device->CreateWindowFramebuffer = PS2LINUX_CreateWindowFramebuffer;
++    device->UpdateWindowFramebuffer = PS2LINUX_UpdateWindowFramebuffer;
++    device->DestroyWindowFramebuffer = PS2LINUX_DestroyWindowFramebuffer;
++    device->GL_LoadLibrary = PS2LINUX_GL_LoadLibrary;
++    device->GL_GetProcAddress = PS2LINUX_GL_GetProcAddress;
++    device->GL_UnloadLibrary = PS2LINUX_GL_UnloadLibrary;
++    device->GL_CreateContext = PS2LINUX_GL_CreateContext;
++    device->GL_MakeCurrent = PS2LINUX_GL_MakeCurrent;
++    device->GL_GetDrawableSize = PS2LINUX_GL_GetDrawableSize;
++    device->GL_SetSwapInterval = PS2LINUX_GL_SetSwapInterval;
++    device->GL_GetSwapInterval = PS2LINUX_GL_GetSwapInterval;
++    device->GL_SwapWindow = PS2LINUX_GL_SwapWindow;
++    device->GL_DeleteContext = PS2LINUX_GL_DeleteContext;
++    device->free = PS2LINUX_DeleteDevice;
++
++    return device;
++}
++
++VideoBootStrap PS2LINUX_bootstrap = {
++    PS2LINUX_DRIVER_NAME, "PlayStation 2 Linux video driver",
++    PS2LINUX_CreateDevice,
++    NULL /* no ShowMessageBox implementation */
++};
++
++#endif /* SDL_VIDEO_DRIVER_PS2LINUX */
++
++/* vi: set ts=4 sw=4 expandtab: */

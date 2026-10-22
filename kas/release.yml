@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+#
+# kas configuration for a published build: the USB drive image and the
+# disc image, with the sources that the GPL and
+# LGPL licenses ask a distributor to offer. Use it on top of ps2.yml:
+#
+#   kas build meta-playstation2/kas/ps2.yml:meta-playstation2/kas/release.yml
+#   meta-playstation2/tools/release.sh build release
+#
+# tools/release.sh gathers the images, the sources, the license manifest
+# and the layer into one directory, with SHA256SUMS.
+#
+# Use a build directory of its own for a release (a fresh clone of the
+# repository): the release must not contain files from a working build.
+
+header:
+  version: 14
+
+target:
+  - ps2-image-usb
+  - ps2-iso
+
+local_conf_header:
+  release: |
+    # No extra files on the disc: a published image holds no game data.
+    # Freedoom is built from its own recipe and stays.
+    PS2_ISO_EXTRA_DIR = ""
+
+    # The sources of every GPL, LGPL and AGPL package, with the patches
+    # of this layer, in tmp/deploy/sources/.
+    INHERIT += "archiver"
+    ARCHIVER_MODE[src] = "original"
+    ARCHIVER_MODE[diff] = "1"

@@ -1,0 +1,15 @@
+# USB drive layout for the PlayStation 2.
+#
+# Partition 1 (FAT):  VMLINUZ.ELF, which uLaunchELF starts from mass:
+# Partition 2 (ext4): root file system, label ps2root
+# Partition 3 (swap): label ps2swap
+#
+# /init and /etc/fstab find the partitions by label (--use-label). With
+# the hard disk driver loaded, the hard disk can be /dev/sda and the USB
+# drive /dev/sdb.
+
+part /boot --source bootimg-partition --ondisk sda --fstype=vfat --label PS2BOOT --use-label --active --align 1024 --fixed-size ${PS2_BOOT_PARTITION_SIZE}M
+part / --source rootfs --ondisk sda --fstype=ext4 --label ps2root --align 1024
+part swap --ondisk sda --fstype=swap --label ps2swap --use-label --align 1024 --size 128M
+
+bootloader --ptable msdos

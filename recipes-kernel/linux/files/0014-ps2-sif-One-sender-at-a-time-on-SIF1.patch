@@ -1,0 +1,70 @@
+From 05136fcc18831a0ce1ed4705bcf55336dd31036d Mon Sep 17 00:00:00 2001
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Mon, 19 Oct 2026 17:00:02 +0100
+Subject: [PATCH 1/2] ps2: sif: One sender at a time on SIF1
+
+A SIF command is two DMA transfers through one buffer, and the second
+waits for the first. Senders run in process context (module loading),
+in the SIF0 interrupt (RPC binds) and in the sound driver. Without a
+claim, two senders can write the buffer at the same time.
+
+The claim spins with interrupts on. The IOP answers some commands with
+a packet of its own, and that packet needs the SIF0 interrupt of this
+side to re-arm the channel, so a wait with interrupts off ends in the
+5 s timeout. A sender in interrupt context goes ahead without the
+claim, as all senders did before.
+
+Upstream-Status: Pending
+---
+ drivers/ps2/sif.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/ps2/sif.c b/drivers/ps2/sif.c
+index b2bfbab7f..fc1568589 100644
+--- a/drivers/ps2/sif.c
++++ b/drivers/ps2/sif.c
+@@ -101,6 +101,17 @@ struct sif_cmd_handler
+ };
+ 
+ static DEFINE_SPINLOCK(sregs_lock);
++
++/*
++ * One sender at a time on SIF1. A command is two DMA transfers through one
++ * buffer, and the second waits for the first. The claim spins with
++ * interrupts on: the IOP answers some commands with a packet of its own,
++ * and that packet needs the SIF0 interrupt of this side to re-arm the
++ * channel, so a wait with interrupts off ends in the 5 s timeout. A sender
++ * in interrupt context cannot wait for a claim held by the context it
++ * interrupted. It goes ahead without the claim, as all senders did before.
++ */
++static unsigned long sif1_claim;
+ static s32 sregs[32];
+ 
+ static iop_addr_t iop_buffer; /* Address of IOP SIF DMA receive address */
+@@ -316,15 +327,23 @@ int sif_cmd_opt_data(u32 cmd, u32 opt, const void *pkt,
+ 		.cmd         = cmd,
+ 		.opt         = opt
+ 	};
++	const bool claim = !in_irq();
+ 	int err;
+ 
+ 	if (pktsize > SIF_CMD_PACKET_DATA_MAX)
+ 		return -EINVAL;
+ 
++	if (claim)
++		while (test_and_set_bit_lock(0, &sif1_claim))
++			cpu_relax();
++
+ 	err = sif1_write(NULL, dst, src, nbytes);
+ 	if (!err)
+ 		err = sif1_write_irq(&header, iop_buffer, pkt, pktsize);
+ 
++	if (claim)
++		clear_bit_unlock(0, &sif1_claim);
++
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(sif_cmd_opt_data);
+-- 
+2.43.0
+

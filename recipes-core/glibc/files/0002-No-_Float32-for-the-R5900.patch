@@ -1,0 +1,33 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 10:40:00 +0100
+Subject: [PATCH] No _Float32 for the R5900
+
+GCC gives the R5900 float a format of its own with -march=r5900 and
+hard float: no NaN, no infinity, no denormals, the format of the FPU.
+_Float32 exists only for an IEEE format, so GCC has none there, and
+every header that relies on __HAVE_FLOAT32 fails: "'_Float32' is not
+supported on this target". Say so in floatn-common.h. _Float64 and
+_Float32x are double, which stays IEEE in software.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+ bits/floatn-common.h | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/bits/floatn-common.h
++++ b/bits/floatn-common.h
+@@ -32,7 +32,13 @@
+    floating-point type with the right format for this type, and this
+    glibc includes corresponding *fN or *fNx interfaces for it.  */
+ #define __HAVE_FLOAT16 0
+-#define __HAVE_FLOAT32 1
++#if defined _MIPS_ARCH_R5900 && defined __mips_hard_float
++/* GCC gives the R5900 float a format of its own, without NaN or
++   infinity, and offers no _Float32 for it.  */
++# define __HAVE_FLOAT32 0
++#else
++# define __HAVE_FLOAT32 1
++#endif
+ #define __HAVE_FLOAT64 1
+ #define __HAVE_FLOAT32X 1
+ #define __HAVE_FLOAT128X 0

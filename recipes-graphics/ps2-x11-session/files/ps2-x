@@ -1,0 +1,73 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# ps2-x: start the X server and the desktop on the PlayStation 2.
+#
+#   ps2-x            the desktop: matchbox-wm and a terminal
+#   ps2-x <command>  X with the command as the only client, for example
+#                    "ps2-x xeyes"; X stops when the command ends
+#
+# The init has no udev, so the X server cannot find the keyboard and the
+# mouse by itself. This script reads /proc/bus/input/devices and writes
+# them into /etc/X11/xorg.conf.d/10-ps2-input.conf: the first keyboard and
+# the first mouse, through the evdev driver.
+
+conf=/etc/X11/xorg.conf.d/10-ps2-input.conf
+mkdir -p /etc/X11/xorg.conf.d
+
+# The X server writes /var/log/Xorg.0.log. /var/log points into
+# /var/volatile, a RAM directory that is empty at each boot, and the image
+# has no syslog to create it.
+mkdir -p /var/volatile/log
+
+# One line a device: its handlers, for example "sysrq kbd leds event0"
+handlers=$(sed -n 's/^H: Handlers=//p' /proc/bus/input/devices)
+
+keyboard=
+mouse=
+for line in $(echo "$handlers" | tr ' ' '_'); do
+	h=$(echo "$line" | tr '_' ' ')
+	event=$(echo "$h" | grep -o 'event[0-9]*')
+	[ -n "$event" ] || continue
+	case " $h " in
+	*" kbd "*)
+		[ -n "$keyboard" ] || keyboard=/dev/input/$event ;;
+	*" mouse"[0-9]*)
+		[ -n "$mouse" ] || mouse=/dev/input/$event ;;
+	esac
+done
+
+{
+	echo "# Written by ps2-x at each start. Edit /usr/bin/ps2-x instead."
+	if [ -n "$keyboard" ]; then
+		cat <<EOK
+Section "InputDevice"
+	Identifier "Keyboard"
+	Driver "evdev"
+	Option "Device" "$keyboard"
+	Option "CoreKeyboard"
+EndSection
+EOK
+	fi
+	if [ -n "$mouse" ]; then
+		cat <<EOM
+Section "InputDevice"
+	Identifier "Mouse"
+	Driver "evdev"
+	Option "Device" "$mouse"
+	Option "CorePointer"
+EndSection
+EOM
+	fi
+} > "$conf"
+
+echo "ps2-x: keyboard ${keyboard:-none}, mouse ${mouse:-none}"
+
+# xinit takes its first argument as the program only when it starts with
+# "/" or ".", and runs xterm otherwise: give it the full path.
+if [ $# -gt 0 ]; then
+	program=$(command -v "$1") || { echo "ps2-x: $1: not found" >&2; exit 1; }
+	shift
+	exec xinit "$program" "$@" -- /usr/bin/X :0 vt7 -nolisten tcp
+fi
+exec xinit /etc/ps2-x/session -- /usr/bin/X :0 vt7 -nolisten tcp

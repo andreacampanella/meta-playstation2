@@ -1,0 +1,74 @@
+From eeacaa84adf3046284749f46d041f33755262889 Mon Sep 17 00:00:00 2001
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Tue, 20 Oct 2026 10:23:06 +0100
+Subject: [PATCH] MIPS: PS2: Keep the ROMs out of the memory map
+
+The port registered ROM0 and ROM1 as memory regions of type
+BOOT_MEM_ROM_DATA. The MIPS setup adds such a region to the memory
+map and reserves it. The flat memory model sizes the page array from
+the end of the map, and ROM0 ends at 512 MiB. So the array had 131072
+entries of 32 bytes, 4 MiB of the 32 MiB of RAM, for 8192 pages of
+RAM. MemTotal was 24380 KiB.
+
+Register the ROMs as I/O resources instead, so that they stay in
+/proc/iomem. The ROM file reads go through phys_to_virt, which needs
+no page entries, and /dev/mem checks the ROM ranges in
+valid_phys_addr_range.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MzD8VdhZHy98irH2xsDHF3
+
+Upstream-Status: Pending
+---
+ arch/mips/ps2/memory.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/ps2/memory.c b/arch/mips/ps2/memory.c
+index 30f45652d..b9f005e5b 100644
+--- a/arch/mips/ps2/memory.c
++++ b/arch/mips/ps2/memory.c
+@@ -30,6 +30,29 @@ int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
+ 	return 1;
+ }
+ 
++/*
++ * The ROMs are not memory regions. A region of type BOOT_MEM_ROM_DATA goes
++ * into the memory map before it is reserved, and the flat memory model
++ * sizes the page array from the end of the map. With ROM0 at 508 MiB in
++ * the map, the array had 131072 entries, 4 MiB of the 32 MiB of RAM, for
++ * 8192 pages of RAM. The ROM reads go through phys_to_virt, which needs
++ * no page entries, and /dev/mem checks the ROM ranges in
++ * valid_phys_addr_range above.
++ */
++static struct resource rom0_resource = {
++	.name	= "ROM0",
++	.start	= ROM0_BASE,
++	.end	= ROM0_BASE + ROM0_SIZE - 1,
++	.flags	= IORESOURCE_MEM | IORESOURCE_READONLY,
++};
++
++static struct resource rom1_resource = {
++	.name	= "ROM1",
++	.start	= ROM1_BASE,
++	.end	= ROM1_BASE + ROM1_SIZE - 1,
++	.flags	= IORESOURCE_MEM | IORESOURCE_READONLY,
++};
++
+ void __init plat_mem_setup(void)
+ {
+ 	ioport_resource.start = 0x10000000;
+@@ -39,8 +62,9 @@ void __init plat_mem_setup(void)
+ 	iomem_resource.end   = KSEG2 - 1;
+ 
+ 	add_memory_region(0x00000000, 0x02000000, BOOT_MEM_RAM);
+-	add_memory_region(ROM0_BASE, ROM0_SIZE, BOOT_MEM_ROM_DATA);
+-	add_memory_region(ROM1_BASE, ROM1_SIZE, BOOT_MEM_ROM_DATA);
++
++	request_resource(&iomem_resource, &rom0_resource);
++	request_resource(&iomem_resource, &rom1_resource);
+ 
+ 	set_io_port_base(CKSEG1);	/* KSEG1 is uncached */
+ }
+-- 
+2.43.0
+

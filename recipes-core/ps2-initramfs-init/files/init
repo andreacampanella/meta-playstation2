@@ -1,0 +1,137 @@
+#!/bin/sh
+# Start script for the PlayStation 2 initramfs.
+#
+# 1. Load the kernel modules for USB, then the ones for the hard disk.
+# 2. Look for a root file system: first on the hard disk, then on a USB drive.
+# 3. Switch to the first one found. If there is none, start BusyBox init
+#    from RAM.
+#
+# Kernel command line options:
+#   root=<device>     root device, for example root=/dev/sda2,
+#                     root=LABEL=ps2root or root=PARTLABEL=linux-root
+#   root=ram          do not look for a root file system
+#   ps2swap=<device>  swap device, in the same forms
+#
+# ROOT and SWAP are lists of the same length, in the order of preference.
+# The swap device at a place in SWAP goes with the root device at the same
+# place in ROOT. The defaults:
+#   PARTLABEL=linux-root  the APA partition of "ps2-disk apa-format" on
+#                         the hard disk, with PARTLABEL=linux-swap
+#   LABEL=ps2root         the root partition of the USB image, with
+#                         LABEL=ps2swap
+# A PARTLABEL is the APA name of a partition (PARTNAME in the uevent of the
+# block device, kernel patch 0018). A LABEL is a file system label.
+
+MODULES="@MODULES@"
+DISK_MODULES="@DISK_MODULES@"
+ROOT="@ROOT@"
+SWAP="@SWAP@"
+WAIT="@WAIT@"
+
+# A device that is not the first choice must wait this many seconds, so a
+# late hard disk still wins over a USB drive.
+GRACE=2
+
+echo "init: started"
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        root=*) ROOT="${arg#root=}" ;;
+        ps2swap=*) SWAP="${arg#ps2swap=}" ;;
+    esac
+done
+
+for m in $MODULES; do
+    echo "init: modprobe $m"
+    modprobe "$m"
+done
+
+# iop-dev9 fails when the console has no expansion device. modprobe waits
+# for the disk probe, so the partitions exist when it returns.
+for m in $DISK_MODULES; do
+    echo "init: modprobe $m"
+    modprobe "$m" 2>/dev/null || break
+done
+
+# The device node for a device name in one of the forms above
+resolve() {
+    local u d
+    case "$1" in
+        PARTLABEL=*)
+            for u in /sys/class/block/*/uevent; do
+                if grep -qx "PARTNAME=${1#PARTLABEL=}" "$u" 2>/dev/null; then
+                    d=${u%/uevent}
+                    echo "/dev/${d##*/}"
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        LABEL=*)
+            d=$(blkid 2>/dev/null | grep " LABEL=\"${1#LABEL=}\"" | head -n 1 | cut -d: -f1)
+            [ -n "$d" ] && [ -b "$d" ] && echo "$d"
+            ;;
+        *)
+            [ -b "$1" ] && echo "$1"
+            ;;
+    esac
+}
+
+# Word number $1 of the list $2
+word() {
+    echo "$2" | awk -v n="$1" '{ print $n }'
+}
+
+try_root() {
+    local dev=$1 swap=$2
+    if ! mount -o rw,noatime "$dev" /newroot; then
+        echo "init: cannot mount $dev"
+        return 1
+    fi
+    if [ ! -e /newroot/sbin/init ] && [ ! -L /newroot/sbin/init ]; then
+        echo "init: no /sbin/init on $dev"
+        umount /newroot
+        return 1
+    fi
+    if [ -n "$swap" ]; then
+        swap=$(resolve "$swap") && swapon "$swap" && echo "init: swap on $swap"
+    fi
+    echo "init: switch to $dev"
+    mount -o move /dev /newroot/dev
+    umount /sys
+    umount /proc
+    exec switch_root /newroot /sbin/init
+}
+
+if [ -n "$ROOT" ] && [ "$ROOT" != "ram" ]; then
+    echo "init: look for the root file system: $ROOT"
+    n=0
+    tried=""
+    while [ "$n" -lt "$WAIT" ]; do
+        i=1
+        for spec in $ROOT; do
+            if [ "$i" = 1 ] || [ "$n" -ge "$GRACE" ]; then
+                case " $tried " in
+                    *" $spec "*) ;;
+                    *)
+                        if dev=$(resolve "$spec"); then
+                            tried="$tried $spec"
+                            echo "init: $spec is $dev"
+                            try_root "$dev" "$(word "$i" "$SWAP")"
+                        fi
+                        ;;
+                esac
+            fi
+            i=$((i + 1))
+        done
+        sleep 1
+        n=$((n + 1))
+    done
+    echo "init: no root file system found"
+fi
+
+echo "init: start BusyBox init from RAM"
+exec /sbin/init

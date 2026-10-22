@@ -1,0 +1,20 @@
+#!/bin/sh
+# Compressed swap in RAM for the PlayStation 2.
+#
+# The console has 32 MiB. A zram device keeps swapped pages in RAM in
+# compressed form, at memory speed, where the USB drive swap crawls at
+# about 1 MiB/s. Game data compresses two to three times. The zram device
+# gets a higher priority than the drive, so the drive is the second level.
+#
+# PS2_ZRAM_SIZE: the size of the device in MiB (the uncompressed limit).
+# The compressed pages take about a third of it. 0 turns it off.
+
+SIZE="${PS2_ZRAM_SIZE:-@SIZE@}"
+
+[ "$SIZE" -gt 0 ] 2>/dev/null || exit 0
+modprobe zram 2>/dev/null
+[ -e /sys/block/zram0 ] || exit 0
+echo lzo > /sys/block/zram0/comp_algorithm 2>/dev/null
+echo "${SIZE}M" > /sys/block/zram0/disksize || exit 0
+mkswap /dev/zram0 > /dev/null 2>&1 || exit 0
+swapon -p 100 /dev/zram0 && echo "ps2-zram: ${SIZE} MiB of compressed swap"

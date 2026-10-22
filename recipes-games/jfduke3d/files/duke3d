@@ -1,0 +1,20 @@
+#!/bin/sh
+# Duke Nukem 3D (JFDuke3D, software renderer) on the PlayStation 2.
+# The game searches its data directory for DUKE3D.GRP, so a link there
+# points to the file. The places, in order: ~/games/duke3d, the hard disk
+# (/data), the FAT partition (/boot).
+GAMES="${HOME:-/home/root}/games"
+GRP=""
+for f in "$GAMES/duke3d/DUKE3D.GRP" "$GAMES/duke3d/duke3d.grp" \
+         /data/DUKE3D.GRP /data/duke3d.grp /boot/DUKE3D.GRP; do
+    if [ -f "$f" ]; then
+        GRP=$f
+        break
+    fi
+done
+if [ -z "$GRP" ]; then
+    echo "duke3d: no DUKE3D.GRP. Put it in $GAMES/duke3d/" >&2
+    exit 1
+fi
+ln -sf "$GRP" /usr/share/games/jfduke3d/duke3d.grp 2>/dev/null
+exec /usr/libexec/jfduke3d/duke3d "$@"

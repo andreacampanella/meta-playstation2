@@ -1,0 +1,26 @@
+#!/bin/sh
+# Doom (doomgeneric) on the PlayStation 2.
+#
+# The game data (IWAD): with no -iwad option, the first file found in
+# ~/games/doom (doom.wad, doom2.wad, plutonia.wad, tnt.wad, doom1.wad, in
+# small or capital letters), then doom1.wad on the hard disk (/data) and
+# on the FAT partition (/boot), then Freedoom, which the image has.
+# "ps2-doom -iwad FILE" starts FILE.
+GAMES="${HOME:-/home/root}/games"
+BIN=/usr/libexec/ps2-doom/ps2-doom
+
+for arg in "$@"; do
+    [ "$arg" = "-iwad" ] && exec "$BIN" "$@"
+done
+
+for name in doom.wad doom2.wad plutonia.wad tnt.wad doom1.wad; do
+    upper=$(echo "$name" | tr a-z A-Z)
+    for f in "$GAMES/doom/$name" "$GAMES/doom/$upper"; do
+        [ -f "$f" ] && exec "$BIN" -iwad "$f" "$@"
+    done
+done
+for f in /data/doom1.wad /boot/doom1.wad /usr/share/games/doom/freedoom1.wad; do
+    [ -f "$f" ] && exec "$BIN" -iwad "$f" "$@"
+done
+echo "ps2-doom: no game data. Put doom1.wad in $GAMES/doom/" >&2
+exit 1

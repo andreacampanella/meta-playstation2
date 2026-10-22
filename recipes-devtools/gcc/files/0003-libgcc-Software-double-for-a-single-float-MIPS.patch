@@ -1,0 +1,66 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 11:40:00 +0100
+Subject: [PATCH] libgcc: Software double for a single-float MIPS
+
+With hard float, the MIPS libgcc builds thin C wrappers around the
+hardware instructions for float and double (t-hardfp-sfdf). With
+-msingle-float there are no double instructions, so a wrapper such as
+__floatunsidf, whose body is "return (double) x", compiles to a call
+to __floatunsidf, and every program dies in that recursion at its
+first use of a double.
+
+Keep the wrappers for float, and take the double routines and the
+conversions between float and double from soft-fp, as a soft-float
+build does. config.host asks the compiler whether __mips_single_float
+is defined; the configure check for hard float runs before it.
+
+Upstream-Status: Inappropriate [PlayStation 2 port; a candidate for upstream]
+---
+diff --git a/libgcc/config.host b/libgcc/config.host
+index 9aa36bf..80126c8 100644
+--- a/libgcc/config.host
++++ b/libgcc/config.host
+@@ -165,7 +165,15 @@ mips*-*-*)
+ 	cpu_type=mips
+ 	tmake_file="mips/t-mips"
+ 	if test "${libgcc_cv_mips_hard_float}" = yes; then
+-		tmake_file="${tmake_file} t-hardfp-sfdf t-hardfp"
++		# With -msingle-float (the R5900) the FPU has no double
++		# format: float routines wrap the hardware, double
++		# routines are software.
++		if ${CC} ${CFLAGS} -dM -E - < /dev/null 2>/dev/null \
++		   | grep -q __mips_single_float; then
++			tmake_file="${tmake_file} mips/t-hardfp-sf t-hardfp mips/t-softfp-df"
++		else
++			tmake_file="${tmake_file} t-hardfp-sfdf t-hardfp"
++		fi
+ 	else
+ 		tmake_file="${tmake_file} t-softfp-sfdf"
+ 	fi
+diff --git a/libgcc/config/mips/t-hardfp-sf b/libgcc/config/mips/t-hardfp-sf
+new file mode 100644
+index 0000000..f769c2b
+--- /dev/null
++++ b/libgcc/config/mips/t-hardfp-sf
+@@ -0,0 +1,7 @@
++# A single-float target (-msingle-float): the float routines wrap the
++# hardware instructions. The double routines, and the conversions
++# between float and double, come from soft-fp: see t-softfp-df.
++hardfp_float_modes := sf
++hardfp_int_modes := si
++hardfp_extensions :=
++hardfp_truncations :=
+diff --git a/libgcc/config/mips/t-softfp-df b/libgcc/config/mips/t-softfp-df
+new file mode 100644
+index 0000000..5f1b5dc
+--- /dev/null
++++ b/libgcc/config/mips/t-softfp-df
+@@ -0,0 +1,8 @@
++# A single-float target (-msingle-float): the double routines, and the
++# conversions between float and double, are software.
++
++softfp_float_modes := df
++softfp_int_modes := si di
++softfp_extensions := sfdf
++softfp_truncations := dfsf
++softfp_exclude_libgcc2 := n

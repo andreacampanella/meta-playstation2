@@ -1,0 +1,26 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 10:20:00 +0100
+Subject: [PATCH] libgcc: No MIPS16 float stubs for the R5900
+
+mips16.S holds the stubs that let MIPS16 code call hard float
+routines. The R5900 has no MIPS16, and two of the instructions in the
+file do not exist on it: c.un.s needs NaN, which the FPU has not, and
+GAS refuses the trunc.w.s macro on this CPU. Skip the file for
+-march=r5900, as it is for soft float and microMIPS.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+ libgcc/config/mips/mips16.S | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/libgcc/config/mips/mips16.S
++++ b/libgcc/config/mips/mips16.S
+@@ -27,7 +27,7 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+ #include "auto-host.h"
+ 
+ #if defined(__mips_micromips) || defined(__mips_soft_float) \
+-    || __mips_isa_rev >= 6
++    || __mips_isa_rev >= 6 || defined(_MIPS_ARCH_R5900)
+   /* Do nothing because this code is only needed when linking
+      against mips16 hard-float objects.  Neither micromips code
+      nor soft-float nor MIPS R6 code can be linked against mips16

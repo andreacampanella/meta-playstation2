@@ -1,0 +1,83 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Sat, 17 Oct 2026 22:00:00 +0100
+Subject: [PATCH] ps2gs: Map the packet buffer uncached accelerated
+
+The library builds each frame's packets in the buffer it maps from
+/dev/ps2gs: 256 KiB written once a frame and read by the DMA. With a
+cached mapping, each 64-byte line the program writes is fetched from
+memory first (the data cache is 8 KiB, write allocate), at more than a
+hundred cycles a line. A profile of the library had a third of its time
+in the vertex copy, which is thirteen stores.
+
+The EE has an uncached accelerated mode (C = 7 in the TLB): a store goes
+to the write buffer, sequential stores merge into one burst, nothing is
+fetched. The homebrew SDK builds its DMA packets that way. Give the
+R5900 that mode as its write-combine attribute, map the buffer with it,
+and write back and invalidate the cached alias once after the zeroing,
+so that no stale line can come down over the program's data. The send
+needs no cache writeback any more, only an empty write buffer.
+
+PS2GS_VERSION is 3. A library that sees 3 puts a sync before each send
+and before it reads the buffer back.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+diff --git a/drivers/ps2/gs-dev.c b/drivers/ps2/gs-dev.c
+index 63913f3..62ecb26 100644
+--- a/drivers/ps2/gs-dev.c
++++ b/drivers/ps2/gs-dev.c
+@@ -41,7 +41,7 @@
+ 
+ #include <uapi/linux/ps2gs.h>
+ 
+-#define PS2GS_VERSION		2	/* 2: PS2GS_IOC_RECEIVE */
++#define PS2GS_VERSION		3	/* 2: PS2GS_IOC_RECEIVE. 3: the buffer is uncached accelerated */
+ /* The buffer taken at the start: the size the library asks for by default */
+ #define PS2GS_RESERVED_BUFFER	(256 * 1024)
+ 
+@@ -341,7 +341,12 @@ static int ps2gs_send(struct ps2gs_file *f, const struct ps2gs_send *s)
+ 
+ 	ch = &ps2gs.channel[s->channel];
+ 
+-	dma_cache_wback((unsigned long)f->virt + s->offset, len);
++	/*
++	 * The program writes the buffer through an uncached accelerated
++	 * mapping (see ps2gs_mmap), so the cache holds none of it. The
++	 * write buffer of the CPU must be empty before the DMA reads.
++	 */
++	wmb();
+ 
+ 	mutex_lock(&ps2gs.lock);
+ 
+@@ -536,7 +541,18 @@ static int ps2gs_mmap(struct file *file, struct vm_area_struct *vma)
+ 		f->reserved = false;
+ 	}
+ 
++	/*
++	 * Uncached accelerated (C = 7 in the TLB): a store goes to the
++	 * write buffer and from there to memory in 64-byte bursts, with no
++	 * fetch of the cache line first. The library writes each frame's
++	 * packets into this buffer once and never reads them back, so a
++	 * cached mapping only paid for the fetches: a quarter of its time
++	 * for each vertex. The zeroing above went through the cache, so
++	 * that goes out and away before the program writes underneath it.
++	 */
++	dma_cache_wback_inv((unsigned long)page_address(pages), size);
+ 	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
++	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+ 	err = remap_pfn_range(vma, vma->vm_start, page_to_pfn(pages),
+ 		size, vma->vm_page_prot);
+ 	if (err) {
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+index 6169e33..5a947b1 100644
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -1482,6 +1482,8 @@ static inline void cpu_probe_legacy(struct cpuinfo_mips *c, unsigned int cpu)
+ 		c->options = R4K_OPTS | MIPS_CPU_DIVEC | MIPS_CPU_FPU |
+ 			     MIPS_CPU_32FPR;
+ 		c->tlbsize = 48;
++		/* C = 7 in the TLB: uncached accelerated, for DMA packet buffers */
++		c->writecombine = _CACHE_UNCACHED_ACCELERATED;
+ 		break;
+ 	case PRID_IMP_NEVADA:
+ 		c->cputype = CPU_NEVADA;

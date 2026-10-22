@@ -1,0 +1,28 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Fri, 16 Oct 2026 18:40:00 +0100
+Subject: [PATCH] mips: No sqrt builtin with single float
+
+With -msingle-float the compiler has no sqrt.d instruction, so
+__builtin_sqrt becomes a call to sqrt, and __ieee754_sqrt calls itself.
+Keep the builtin for sqrtf only. The same guard exists for fma.
+
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+---
+ sysdeps/mips/fpu/math-use-builtins-sqrt.h | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/sysdeps/mips/fpu/math-use-builtins-sqrt.h
++++ b/sysdeps/mips/fpu/math-use-builtins-sqrt.h
+@@ -1,6 +1,10 @@
+ #include <sgidefs.h>
+ 
+-#define USE_SQRT_BUILTIN (_MIPS_ISA >= _MIPS_ISA_MIPS2)
++#ifdef __mips_single_float
++# define USE_SQRT_BUILTIN 0
++#else
++# define USE_SQRT_BUILTIN (_MIPS_ISA >= _MIPS_ISA_MIPS2)
++#endif
+ #define USE_SQRTF_BUILTIN (_MIPS_ISA >= _MIPS_ISA_MIPS2)
+ #define USE_SQRTL_BUILTIN 0
+ #define USE_SQRTF128_BUILTIN 0

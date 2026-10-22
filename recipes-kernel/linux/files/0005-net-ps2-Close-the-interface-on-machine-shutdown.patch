@@ -1,0 +1,71 @@
+From b92af352d99acf7cf36a1974ee36413bdb6a24e5 Mon Sep 17 00:00:00 2001
+From: hubix94 <hubix94@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 21:59:28 +0200
+Subject: [PATCH 5/5] net: ps2: Close the interface on machine shutdown
+
+Restarting the machine resets the I/O processor, and with it the DEV9
+expansion bay: the SPEED register window stops answering and every access
+from the EE raises a data bus error. The driver's watchdog timer walks
+into that half a second later, in interrupt context:
+
+  reboot: Restarting system
+  Data bus error, epc == c0024020, ra == c0024398
+  epc : readw+0x8/0x18 [ps2_smap]
+  ra  : smap_timer_fn+0x44/0x1bc [ps2_smap]
+  Kernel panic - not syncing: Fatal exception in interrupt
+
+Add a shutdown callback that closes the interface while the hardware is
+still there to be closed, the way ohci-ps2 has always done through
+usb_hcd_platform_shutdown(). device_shutdown() runs it before the machine
+is restarted, so the timer is stopped, the interrupts are released and the
+MACs are disabled before anything touches the bay.
+
+Signed-off-by: hubix94 <hubix94@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+Upstream-Status: Submitted [https://github.com/frno7/linux/pull/96]
+---
+ drivers/net/ethernet/ps2/ps2-smap.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/net/ethernet/ps2/ps2-smap.c b/drivers/net/ethernet/ps2/ps2-smap.c
+index fa8759846..47f0a06ef 100644
+--- a/drivers/net/ethernet/ps2/ps2-smap.c
++++ b/drivers/net/ethernet/ps2/ps2-smap.c
+@@ -58,6 +58,7 @@
+ #include <linux/mii.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
+ #include <linux/phy.h>
+ #include <linux/platform_device.h>
+ #include <linux/skbuff.h>
+@@ -1622,8 +1623,28 @@ static int smap_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static void smap_shutdown(struct platform_device *pdev)
++{
++	struct net_device *ndev = platform_get_drvdata(pdev);
++
++	/*
++	 * Restarting the machine resets the IOP, and with it the expansion
++	 * bay: the register window stops answering and every access from the
++	 * EE raises a data bus error.  The driver's own timer would walk into
++	 * that half a second later, in interrupt context, and take the kernel
++	 * down with a panic on its way out.  Close the interface here, while
++	 * the hardware is still there to be closed.
++	 */
++	if (ndev && netif_running(ndev)) {
++		rtnl_lock();
++		dev_close(ndev);
++		rtnl_unlock();
++	}
++}
++
+ static struct platform_driver smap_driver = {
+ 	.remove	= smap_remove,
++	.shutdown = smap_shutdown,
+ 	.driver	= {
+ 		.name	= DRV_NAME,
+ 	},

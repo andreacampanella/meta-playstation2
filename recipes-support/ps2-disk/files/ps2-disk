@@ -1,0 +1,503 @@
+#!/bin/sh
+# ps2-disk: the hard disk on the network adapter of the PlayStation 2.
+#
+#   ps2-disk status             Load the driver and show the disks, their
+#                               partitions and what is on them.
+#   ps2-disk apa-format [--disk /dev/sdX]
+#                               Format the disk as APA, the format of the
+#                               console software, with three partitions
+#                               for Linux. All data on the disk is lost.
+#   ps2-disk install [KERNEL]   Copy the running system (the USB drive) to
+#                               the APA partition linux-root, the game
+#                               data from /boot to /data in it, and the
+#                               kernel to the PFS partition +linux.
+#   ps2-disk kernel [KERNEL]    Copy a new kernel to +linux only.
+#   ps2-disk setup [--force]    The other way: an MBR table with a swap and
+#                               an ext4 data partition, for a disk that is
+#                               only a data disk. All data on it is lost.
+#   ps2-disk mount              Start the swap and mount the data partition
+#                               of "setup" at /data. Init runs this at boot.
+#
+# The APA format (apa-format) keeps the disk usable for uLaunchELF and OPL.
+# pfsshell, from the ps2sdk APA and PFS code, writes the table. The kernel
+# reads it (patch 0018) and names each partition after its APA name. The
+# partitions:
+#   linux-root  ext4, label ps2hdd. One APA segment: 1 GiB on a disk up
+#               to 64 GiB, 2 GiB on a larger disk.
+#   linux-swap  swap, label ps2hddswap, @SWAP@ MiB
+#   +linux      PFS, 128 MiB. VMLINUZ.ELF, which uLaunchELF starts from
+#               hdd0:/+linux/VMLINUZ.ELF
+# The rest of the disk stays free for the console software and OPL.
+# /init looks for linux-root first, so with VMLINUZ.ELF on the hard disk
+# the USB drive is not needed.
+#
+# The MBR format (setup) gives two partitions: swap (ps2swap, @SWAP@ MiB)
+# and ext4 data (ps2data, the rest), mounted at /data. uLaunchELF does not
+# see a disk in this format.
+
+SWAP_MIB=@SWAP@
+DATA=/data
+PFSSHELL_LOG=/tmp/ps2-disk-pfsshell.log
+TARGET=/mnt/ps2-disk-root
+
+log() {
+    echo "ps2-disk: $*"
+}
+
+fail() {
+    log "$*"
+    exit 1
+}
+
+load_driver() {
+    modprobe iop-dev9 2>/dev/null
+    modprobe pata-ps2 2>/dev/null
+}
+
+# The device of the root file system, for example /dev/sda8
+root_device() {
+    awk '$2 == "/" && $1 ~ /^\/dev\// { d = $1 } END { print d }' /proc/mounts
+}
+
+# The disk of a partition: /dev/sda8 -> /dev/sda
+disk_of() {
+    echo "$1" | sed 's/[0-9]*$//'
+}
+
+root_disk() {
+    local dev
+    dev=$(root_device)
+    case "$dev" in
+        /dev/sd*) disk_of "$dev" ;;
+        *) echo "" ;;
+    esac
+}
+
+# The APA name of a partition (PARTNAME), or nothing
+partname() {
+    sed -n 's/^PARTNAME=//p' "/sys/class/block/${1##*/}/uevent" 2>/dev/null
+}
+
+# The partition with an APA name, for example /dev/sda8 for linux-root
+find_partname() {
+    local u d
+    for u in /sys/class/block/sd*/uevent; do
+        [ -e "$u" ] || continue
+        if grep -qx "PARTNAME=$1" "$u"; then
+            d=${u%/uevent}
+            echo "/dev/${d##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The disks that are not the root disk and not removable
+candidate_disks() {
+    local root d name
+    root=$(root_disk)
+    for d in /sys/block/sd*; do
+        [ -e "$d" ] || continue
+        name=${d##*/}
+        [ "/dev/$name" = "$root" ] && continue
+        [ "$(cat "$d/removable" 2>/dev/null)" = 1 ] && continue
+        echo "/dev/$name"
+    done
+}
+
+# The one hard disk, or the --disk argument
+pick_disk() {
+    local disk=$1 n=0 d
+    if [ -n "$disk" ]; then
+        echo "$disk"
+        return 0
+    fi
+    for d in $(candidate_disks); do
+        disk=$d
+        n=$((n + 1))
+    done
+    if [ "$n" = 0 ]; then
+        log "no hard disk found. ps2-disk status shows what the kernel sees." >&2
+        return 1
+    fi
+    if [ "$n" -gt 1 ]; then
+        log "more than one disk. Name one with --disk /dev/sdX" >&2
+        return 1
+    fi
+    echo "$disk"
+}
+
+# Wait for a block device with the label, up to the given seconds
+wait_label() {
+    local label=$1 secs=$2 dev
+    while [ "$secs" -gt 0 ]; do
+        dev=$(blkid 2>/dev/null | grep " LABEL=\"$label\"" | head -n 1 | cut -d: -f1)
+        if [ -n "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+        sleep 1
+        secs=$((secs - 1))
+    done
+    return 1
+}
+
+# The APA format: the magic "APA" at byte 4 of sector 0, the text "Sony
+# Computer Entertainment Inc." at byte 256, and a valid checksum. fdisk
+# keeps the first 440 bytes of sector 0 when it writes a new MBR table
+# (ps2-disk setup --force), so the magic and the text survive on a disk
+# that is no longer APA. The new table changes the bytes under the
+# checksum. The checksum is the sum of the 32-bit words 1 to 255 of the
+# header, or 1 to 127 for a disk with a protective MBR (as the kernel
+# reader, patch 0018).
+has_apa() {
+    local magic text
+    magic=$(dd if="$1" bs=1 skip=4 count=3 2>/dev/null)
+    text=$(dd if="$1" bs=1 skip=256 count=27 2>/dev/null)
+    [ "$magic" = "APA" ] && [ "$text" = "Sony Computer Entertainment" ] || return 1
+    # BusyBox od has no -A or -t. -D prints 4-byte unsigned words after
+    # an offset column.
+    dd if="$1" bs=512 count=2 2>/dev/null | od -v -D | awk '
+        { for (i = 2; i <= NF; i++) w[n++] = $i }
+        END {
+            if (n < 256) exit 1
+            for (i = 1; i < 256; i++) { full += w[i]; if (i < 128) half += w[i] }
+            m = 4294967296
+            exit !(full % m == w[0] || half % m == w[0])
+        }'
+}
+
+# One line about what is on the disk now
+disk_contents() {
+    local p n=0 list=""
+    if has_apa "$1"; then
+        echo "APA (console software, uLaunchELF, OPL)"
+        return
+    fi
+    for p in "$1"[0-9]*; do
+        [ -e "$p" ] || continue
+        n=$((n + 1))
+        list="$list $(blkid "$p" 2>/dev/null | sed -n 's/.* LABEL="\([^"]*\)".*/\1/p')"
+    done
+    if [ "$n" = 0 ]; then
+        echo "no partitions"
+    else
+        echo "$n partitions, labels:$list"
+    fi
+}
+
+size_mib() {
+    local sectors
+    sectors=$(cat "/sys/class/block/${1##*/}/size" 2>/dev/null || echo 0)
+    echo $((sectors / 2048))
+}
+
+# Run pfsshell on the disk with the commands on standard input. The output
+# goes to the log, and to the screen with -v.
+pfsshell_run() {
+    local disk=$1
+    { echo "device $disk"; cat; echo "exit"; } | pfsshell > "$PFSSHELL_LOG" 2>&1
+}
+
+# The largest APA segment of the disk in MiB, as the APA driver computes
+# it ("max" in the pfsshell output, in sectors)
+apa_max_mib() {
+    local max
+    echo "" | pfsshell_run "$1"
+    max=$(sed -n 's/.*sectors, max \(0x[0-9a-fA-F]*\).*/\1/p' "$PFSSHELL_LOG" | head -n 1)
+    [ -n "$max" ] || return 1
+    echo $(($max / 2048))
+}
+
+# Swap off and unmount everything on the disk
+release_disk() {
+    local p
+    for p in $(awk -v d="$1" 'index($1, d) == 1 { print $1 }' /proc/swaps); do
+        swapoff "$p" && log "swap off $p"
+    done
+    for p in $(awk -v d="$1" 'index($1, d) == 1 { print $2 }' /proc/mounts); do
+        umount "$p" && log "unmounted $p"
+    done
+}
+
+confirm() {
+    local disk=$1 answer
+    printf 'Type the device name to go on: '
+    read -r answer
+    if [ "$answer" != "$disk" ]; then
+        log "you typed \"$answer\", not \"$disk\". Stopped, nothing changed."
+        exit 1
+    fi
+}
+
+cmd_status() {
+    local d p name root
+    load_driver
+    sleep 2
+    root=$(root_device)
+    echo "Kernel messages about the disk:"
+    dmesg | grep -i "ata\|pata\|dev9\|APA" | grep -v "usb\|sata_" | tail -n 15
+    echo
+    echo "Root file system: $root"
+    echo "Disks:"
+    for d in /sys/block/sd*; do
+        [ -e "$d" ] || continue
+        d=/dev/${d##*/}
+        printf '  %s: %s MiB, model %s' "$d" "$(size_mib "$d")" \
+            "$(cat "/sys/block/${d##*/}/device/model" 2>/dev/null)"
+        [ "$(cat "/sys/block/${d##*/}/removable" 2>/dev/null)" = 1 ] && printf ', removable'
+        echo
+        echo "    $(disk_contents "$d")"
+        for p in "$d"[0-9]*; do
+            [ -e "$p" ] || continue
+            name=$(partname "$p")
+            printf '    %-10s %6s MiB  %-12s %s' "$p" "$(size_mib "$p")" "$name" \
+                "$(blkid "$p" 2>/dev/null | cut -d: -f2-)"
+            [ "$p" = "$root" ] && printf '  (root)'
+            echo
+        done
+    done
+    echo
+    echo "Swap:"
+    cat /proc/swaps
+    echo
+    echo "Mounted at $DATA:"
+    grep " $DATA " /proc/mounts || echo "  nothing"
+}
+
+cmd_apa_format() {
+    local disk="" max root_mib dev
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --disk) shift; disk=$1 ;;
+            *) echo "ps2-disk apa-format [--disk /dev/sdX]"; return 1 ;;
+        esac
+        shift
+    done
+    command -v pfsshell > /dev/null || fail "pfsshell is not installed."
+    load_driver
+    sleep 2
+    disk=$(pick_disk "$disk") || exit 1
+    [ "$disk" = "$(root_disk)" ] && fail "$disk holds the root file system. Stop."
+    case "$SWAP_MIB" in
+        128|256|512|1024) ;;
+        *) fail "the swap size $SWAP_MIB MiB is not 128, 256, 512 or 1024. APA segments are powers of two." ;;
+    esac
+
+    max=$(apa_max_mib "$disk") || fail "pfsshell cannot read $disk. See $PFSSHELL_LOG"
+    # APA puts a segment only at a multiple of its own size. The free
+    # space after __common starts at 2 GiB, so a 4 GiB segment there
+    # becomes 2 GiB plus a sub segment that Linux cannot use (seen on a
+    # 240 GB disk). 2 GiB fits there on every disk.
+    root_mib=$max
+    [ "$root_mib" -gt 2048 ] && root_mib=2048
+    echo "This formats $disk ($(size_mib "$disk") MiB, model $(cat "/sys/block/${disk##*/}/device/model" 2>/dev/null)) as APA."
+    echo "On it now: $(disk_contents "$disk")"
+    grep -q "^$disk" /proc/mounts && echo "Mounted now: $(awk -v d="$disk" 'index($1, d) == 1 { printf "%s ", $2 }' /proc/mounts)"
+    echo "All data on the disk is lost. New partitions:"
+    echo "  the system partitions of the console (__mbr, __net, __system, __sysconf, __common)"
+    echo "  linux-root  ${root_mib} MiB  ext4, the root file system"
+    echo "  linux-swap  ${SWAP_MIB} MiB  swap"
+    echo "  +linux      128 MiB  PFS, for VMLINUZ.ELF"
+    confirm "$disk"
+
+    release_disk "$disk"
+    # The largest partition first: APA cuts segments from the free space
+    # in order, and a big segment after small ones leaves holes.
+    pfsshell_run "$disk" <<EOF
+initialize yes
+mkpart linux-root ${root_mib}M EXT2
+mkpart linux-swap ${SWAP_MIB}M EXT2SWAP
+mkpart +linux 128M PFS
+ls -l
+EOF
+    blockdev --rereadpt "$disk" || fail "the kernel did not read the new table. Restart and run ps2-disk status."
+    sleep 1
+    for name in linux-root linux-swap +linux; do
+        find_partname "$name" > /dev/null || fail "no partition $name after the format. See $PFSSHELL_LOG"
+    done
+
+    dev=$(find_partname linux-swap)
+    mkswap -L ps2hddswap "$dev" > /dev/null || fail "mkswap on $dev failed"
+    log "swap partition $dev"
+    dev=$(find_partname linux-root)
+    # No discard (TRIM): the driver has no DMA, and TRIM is a DMA command.
+    log "ext4 on $dev ($(size_mib "$dev") MiB). This takes a minute."
+    mkfs.ext4 -q -E nodiscard -L ps2hdd "$dev" || fail "mkfs.ext4 on $dev failed"
+    log "done. ps2-disk install copies the system to the disk."
+}
+
+# The kernel file: the argument, or VMLINUZ.ELF on the FAT partition
+kernel_file() {
+    local f=$1
+    [ -n "$f" ] || f=/boot/VMLINUZ.ELF
+    [ -f "$f" ] || fail "no kernel at $f. Name the file: ps2-disk kernel FILE"
+    echo "$f"
+}
+
+# Copy a kernel to +linux as VMLINUZ.ELF and check its size there
+put_kernel() {
+    local disk=$1 file=$2 dir size got
+    find_partname +linux > /dev/null || fail "no partition +linux. Run ps2-disk apa-format first."
+    # pfsshell puts a file from the current directory under its own name
+    dir=$(mktemp -d)
+    cp "$file" "$dir/VMLINUZ.ELF" || fail "cannot copy $file"
+    size=$(wc -c < "$dir/VMLINUZ.ELF")
+    log "kernel $file ($size bytes) to hdd0:/+linux/VMLINUZ.ELF"
+    pfsshell_run "$disk" <<EOF
+mount +linux
+lcd $dir
+rm VMLINUZ.ELF
+put VMLINUZ.ELF
+ls -l
+umount
+EOF
+    rm -rf "$dir"
+    got=$(awk '$NF == "VMLINUZ.ELF" { print $2 }' "$PFSSHELL_LOG" | tail -n 1)
+    [ "$got" = "$size" ] || fail "the kernel on +linux has ${got:-no} bytes, not $size. See $PFSSHELL_LOG"
+    sync
+    log "kernel in place. In uLaunchELF: hdd0:/+linux/VMLINUZ.ELF"
+}
+
+cmd_kernel() {
+    local file dev
+    command -v pfsshell > /dev/null || fail "pfsshell is not installed."
+    load_driver
+    file=$(kernel_file "$1")
+    dev=$(find_partname +linux) || fail "no partition +linux. Run ps2-disk apa-format first."
+    put_kernel "$(disk_of "$dev")" "$file"
+}
+
+cmd_install() {
+    local file dev disk src used free f
+    command -v pfsshell > /dev/null || fail "pfsshell is not installed."
+    load_driver
+    sleep 2
+    file=$(kernel_file "$1")
+    dev=$(find_partname linux-root) || fail "no partition linux-root. Run ps2-disk apa-format first."
+    disk=$(disk_of "$dev")
+    [ "$dev" = "$(root_device)" ] && fail "the system runs from $dev already. ps2-disk kernel copies a new kernel."
+    grep -q "^$dev " /proc/mounts && fail "$dev is mounted. Unmount it first."
+
+    mkdir -p "$TARGET"
+    mount -t ext4 -o noatime "$dev" "$TARGET" || fail "cannot mount $dev. Run ps2-disk apa-format first."
+    used=$(df -k / | awk 'NR == 2 { print $3 }')
+    free=$(df -k "$TARGET" | awk 'NR == 2 { print $4 }')
+    if [ "$used" -ge "$free" ]; then
+        umount "$TARGET"
+        fail "the system needs $((used / 1024)) MiB, and $dev has $((free / 1024)) MiB free."
+    fi
+    if [ -e "$TARGET/sbin/init" ] || [ -L "$TARGET/sbin/init" ]; then
+        echo "$dev holds a system already. Its files are replaced."
+        confirm "$dev"
+        for f in "$TARGET"/* "$TARGET"/.[!.]*; do
+            [ -e "$f" ] || [ -L "$f" ] || continue
+            [ "$f" = "$TARGET/lost+found" ] && continue
+            rm -rf "$f"
+        done
+    fi
+
+    # A bind mount shows the root file system without what is mounted on
+    # it (/dev, /proc, /boot, /var/volatile).
+    src=$(mktemp -d)
+    mount -o bind / "$src" || fail "cannot bind-mount /"
+    log "copy the system: $((used / 1024)) MiB from the USB drive. This takes some minutes."
+    if ! cp -a "$src/." "$TARGET/"; then
+        umount "$src"
+        umount "$TARGET"
+        fail "the copy failed"
+    fi
+    umount "$src"
+    rmdir "$src"
+
+    # The game data on the FAT partition goes to /data, the second place
+    # where the games look. There is no FAT partition on the hard disk.
+    mkdir -p "$TARGET$DATA"
+    if grep -q " /boot " /proc/mounts; then
+        for f in /boot/*; do
+            [ -e "$f" ] || continue
+            case "${f##*/}" in
+                VMLINUZ.ELF|System\ Volume\ Information) continue ;;
+            esac
+            log "game data: $f to $DATA/"
+            cp -a "$f" "$TARGET$DATA/" || log "copy of $f failed"
+        done
+    fi
+
+    # The USB partitions are not there when the system runs from the hard
+    # disk. /init starts linux-swap.
+    sed -i -e '/[[:space:]]\/boot[[:space:]]/d' -e '/[[:space:]]swap[[:space:]]/d' "$TARGET/etc/fstab"
+    sync
+    umount "$TARGET"
+    log "system copied to $dev"
+
+    put_kernel "$disk" "$file"
+    echo
+    echo "Done. Start hdd0:/+linux/VMLINUZ.ELF in uLaunchELF. The USB drive is"
+    echo "not needed. With the USB drive in, /init still takes the hard disk."
+}
+
+cmd_setup() {
+    local force=0 disk=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=1 ;;
+            --disk) shift; disk=$1 ;;
+            *) echo "ps2-disk setup [--force] [--disk /dev/sdX]"; return 1 ;;
+        esac
+        shift
+    done
+    load_driver
+    sleep 2
+    disk=$(pick_disk "$disk") || exit 1
+    [ "$disk" = "$(root_disk)" ] && fail "$disk holds the root file system. Stop."
+    if has_apa "$disk" && [ "$force" = 0 ]; then
+        log "$disk has the APA format of the console software. Games of the console may be on it."
+        log "ps2-disk apa-format keeps the APA format. ps2-disk setup --force removes it."
+        return 1
+    fi
+    echo "This removes all data on $disk ($(size_mib "$disk") MiB, model $(cat "/sys/block/${disk##*/}/device/model" 2>/dev/null))."
+    echo "Partitions: swap ${SWAP_MIB} MiB, then ext4 data with the rest."
+    echo "uLaunchELF does not see a disk in this format."
+    confirm "$disk"
+    release_disk "$disk"
+    # A new MBR table: partition 1 swap, partition 2 Linux with the rest
+    printf 'o\nn\np\n1\n\n+%dM\nt\n82\nn\np\n2\n\n\nw\n' "$SWAP_MIB" | fdisk "$disk" > /dev/null || fail "fdisk failed"
+    sleep 2
+    [ -e "${disk}1" ] && [ -e "${disk}2" ] || fail "the kernel does not see the new partitions. Restart the console and run the setup again."
+    mkswap -L ps2swap "${disk}1" || return 1
+    # No discard (TRIM): the driver has no DMA, and TRIM is a DMA command.
+    mkfs.ext4 -q -E nodiscard -L ps2data "${disk}2" || return 1
+    log "done. ps2-disk mount starts the swap and mounts the data partition now, and init does it at each boot."
+}
+
+cmd_mount() {
+    local dev
+    # A system on linux-root: /init started linux-swap, and /data is a
+    # directory of the root file system.
+    [ "$(partname "$(root_device)")" = linux-root ] && return 0
+    load_driver
+    dev=$(wait_label ps2swap 8) && {
+        if ! grep -q "^$dev " /proc/swaps; then
+            swapon -p 50 "$dev" && log "swap on $dev"
+        fi
+    }
+    dev=$(wait_label ps2data 2) && {
+        mkdir -p "$DATA"
+        if ! grep -q " $DATA " /proc/mounts; then
+            mount -t ext4 "$dev" "$DATA" && log "$dev mounted at $DATA"
+        fi
+        mkdir -p "$DATA/descent" "$DATA/id1" 2>/dev/null
+    }
+    return 0
+}
+
+case "$1" in
+    status) cmd_status ;;
+    apa-format) shift; cmd_apa_format "$@" ;;
+    install) shift; cmd_install "$@" ;;
+    kernel) shift; cmd_kernel "$@" ;;
+    setup) shift; cmd_setup "$@" ;;
+    mount) cmd_mount ;;
+    *) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

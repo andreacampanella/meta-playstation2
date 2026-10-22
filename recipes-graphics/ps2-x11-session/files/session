@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# The desktop session of ps2-x: a terminal, the matchbox panel and the
+# matchbox window manager. The session ends, and X with it, when the
+# window manager ends.
+
+# GTK+ connects to the accessibility bus by default. The console has no
+# such bus, and the bridge costs memory in every GTK+ program.
+export NO_AT_BRIDGE=1
+
+rxvt -fn "xft:Bitstream Vera Sans Mono:size=10" -bg black -fg gray90 &
+
+# The panel is optional: remove matchbox-panel-2 and the session runs
+# without it. Left: show the desktop, and a button for each window.
+# Right: the tray and the clock.
+if command -v matchbox-panel >/dev/null; then
+	matchbox-panel --start-applets showdesktop,windowselector \
+		--end-applets systray,clock &
+fi
+
+exec matchbox-window-manager -use_titlebar yes

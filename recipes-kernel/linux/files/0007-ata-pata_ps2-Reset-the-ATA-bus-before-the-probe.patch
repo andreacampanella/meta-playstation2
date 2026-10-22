@@ -1,0 +1,45 @@
+From: Andrea Campanella <emuboy85@gmail.com>
+Subject: [PATCH] ata: pata_ps2: Reset the ATA bus before the probe
+
+The driver never resets the ATA bus of the SPEED interface. The system
+software (ATAD) writes SPD_IF_ATA_RESET to SPD_R_IF_CTRL, then 0 and
+0x48, and sets PIO mode 0 before it looks for a disk. An original IDE
+disk answers without that, a SATA bridge in the bay does not: the port
+comes up with "PATA max UDMA/66" and no device.
+
+Do the same reset in the probe, and print the ATA status afterwards.
+
+Upstream-Status: Inappropriate [PlayStation 2 port]
+
+--- a/drivers/ata/pata_ps2.c
++++ b/drivers/ata/pata_ps2.c
+@@ -11,6 +11,7 @@
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/blkdev.h>
++#include <linux/delay.h>
+ #include <linux/ata.h>
+ #include <linux/libata.h>
+ #include <linux/platform_device.h>
+@@ -419,6 +420,21 @@
+ 
+ 	iop_set_dma_dpcr2(IOP_DMA_DPCR2_DEV9);
+ 
++	/*
++	 * Reset the ATA bus of the interface, as the system software (ATAD)
++	 * does before it looks for a disk, and set PIO mode 0 for the
++	 * identification. Without the reset a SATA bridge in the bay stays
++	 * silent, and the port reports no device.
++	 */
++	outw(SPD_IF_ATA_RESET, SPD_REGBASE + SPD_R_IF_CTRL);
++	udelay(100);
++	outw(0, SPD_REGBASE + SPD_R_IF_CTRL);
++	outw(0x48, SPD_REGBASE + SPD_R_IF_CTRL);
++	msleep(3);
++	outw(0x92, SPD_REGBASE + SPD_R_PIO_MODE);
++	dev_info(&pdev->dev, "ATA bus reset, status %02x\n",
++		ioread8(ap->ioaddr.status_addr));
++
+ 	err = pata_ps2_cmd_bb(pp);
+ 	if (err < 0)
+ 		goto err_bb_cmd;

@@ -1,0 +1,300 @@
+From 142f02c0edf7e51c0d0eac3be88f074cac35340b Mon Sep 17 00:00:00 2001
+From: Andrea Campanella <emuboy85@gmail.com>
+Date: Wed, 21 Oct 2026 13:45:49 +0100
+Subject: [PATCH] block: partitions: Read the APA format of the PlayStation 2
+ hard disk
+
+The system software of the PlayStation 2, uLaunchELF and OPL keep the
+hard disk in the APA format: a ring of partition headers, each in the
+first two sectors of its segment. Linux could not read it, so a disk
+for Linux had to lose its APA table, and with it the partitions of the
+console.
+
+The new reader walks the ring from sector 0 and gives one partition for
+each main segment of a used APA partition. The Linux partition starts
+4 MiB into the segment, after the area that APA keeps for the header
+(PFS starts there too), so a Linux file system never writes over a
+header. Sub segments are not included: their own headers sit inside
+the range they would add. The APA name becomes the partition name
+(PARTNAME), so user space finds a partition by name.
+
+The reader comes before EFI and MS-DOS, because ps2sdk can write a
+protective MBR into the first APA sector.
+
+Upstream-Status: Pending
+---
+ block/partitions/Kconfig  |  10 ++
+ block/partitions/Makefile |   1 +
+ block/partitions/apa.c    | 193 ++++++++++++++++++++++++++++++++++++++
+ block/partitions/apa.h    |   6 ++
+ block/partitions/check.c  |   4 +
+ 5 files changed, 214 insertions(+)
+ create mode 100644 block/partitions/apa.c
+ create mode 100644 block/partitions/apa.h
+
+diff --git a/block/partitions/Kconfig b/block/partitions/Kconfig
+index 702689a62..58291b37e 100644
+--- a/block/partitions/Kconfig
++++ b/block/partitions/Kconfig
+@@ -262,6 +262,16 @@ config SYSV68_PARTITION
+ 	  sysv68).
+ 	  Otherwise, say N.
+ 
++config PS2_APA_PARTITION
++	bool "PlayStation 2 APA partition support" if PARTITION_ADVANCED
++	default y if SONY_PS2
++	help
++	  Say Y here to read the hard disk of the PlayStation 2 in the
++	  partition format of its system software (APA), which uLaunchELF
++	  and OPL also use. Each used APA partition becomes a Linux
++	  partition, without the 4 MiB at its start that holds the APA
++	  header. The APA name is the partition name (PARTNAME).
++
+ config CMDLINE_PARTITION
+ 	bool "Command line partition support" if PARTITION_ADVANCED
+ 	select BLK_CMDLINE_PARSER
+diff --git a/block/partitions/Makefile b/block/partitions/Makefile
+index 2f276b677..bf22affdc 100644
+--- a/block/partitions/Makefile
++++ b/block/partitions/Makefile
+@@ -21,3 +21,4 @@ obj-$(CONFIG_IBM_PARTITION) += ibm.o
+ obj-$(CONFIG_EFI_PARTITION) += efi.o
+ obj-$(CONFIG_KARMA_PARTITION) += karma.o
+ obj-$(CONFIG_SYSV68_PARTITION) += sysv68.o
++obj-$(CONFIG_PS2_APA_PARTITION) += apa.o
+diff --git a/block/partitions/apa.c b/block/partitions/apa.c
+new file mode 100644
+index 000000000..47268187e
+--- /dev/null
++++ b/block/partitions/apa.c
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * APA, the partition format of the PlayStation 2 hard disk
++ *
++ * The system software of the console, uLaunchELF and OPL use APA. The
++ * partitions form a ring of headers. Each header sits in the first two
++ * sectors of its segment and gives the sector of the next header. The ring
++ * starts at sector 0, with the header of __mbr, and the last header points
++ * back to sector 0. The headers are in the order of their sectors.
++ *
++ * A partition is one main segment and up to 64 sub segments. The sizes of
++ * the segments are powers of two. Each segment keeps its first 4 MiB for
++ * its header, and __mbr also for the journal of the system software. PFS
++ * starts at sector 8192 of a segment for the same reason.
++ *
++ * This reader gives Linux one partition for each main segment of a used
++ * partition, without the first 4 MiB. A Linux file system then never
++ * writes over an APA header. The sub segments are not part of the Linux
++ * partition: their headers are inside the range that they would add.
++ * Free segments (type 0) are not listed.
++ *
++ * The APA name of the partition is the PARTNAME of the block device:
++ * /sys/class/block/sda7/uevent has PARTNAME=linux-root.
++ *
++ * The fields are little-endian. See libapa in ps2sdk.
++ */
++
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include "check.h"
++#include "apa.h"
++
++#define APA_MAGIC		0x00415041	/* "APA\0" */
++#define APA_HEADER_BYTES	1024		/* two sectors */
++#define APA_RESERVED_SECTORS	8192		/* 4 MiB at the start of a segment */
++#define APA_TYPE_FREE		0x0000
++#define APA_NAME_BYTES		32
++#define APA_MAX_HEADERS		65536		/* stop on a ring with a loop */
++
++static const char apa_mbr_magic[] = "Sony Computer Entertainment Inc.";
++
++/* The start of the header, with the fields that this reader uses */
++struct apa_header {
++	__le32 checksum;
++	__le32 magic;
++	__le32 next;
++	__le32 prev;
++	char id[APA_NAME_BYTES];
++	char rpwd[8];
++	char fpwd[8];
++	__le32 start;
++	__le32 length;
++	__le16 type;
++	__le16 flags;
++	__le32 nsub;
++	u8 created[8];
++	__le32 main;	/* 0 for a main segment, the main's sector for a sub */
++	__le32 number;
++	__le32 modver;
++	__le32 pad1[7];
++	char pad2[128];
++	char mbr_magic[32];	/* sector 0 only */
++};
++
++/*
++ * The checksum is the sum of the 32-bit words after the checksum word.
++ * The system software sums the two sectors. A disk formatted with a
++ * protective MBR (ps2sdk built with APA_SUPPORT_GPT) sums only the first
++ * sector of the header in sector 0.
++ */
++static u32 apa_sum(const __le32 *words, int count)
++{
++	u32 sum = 0;
++	int i;
++
++	for (i = 1; i < count; i++)
++		sum += le32_to_cpu(words[i]);
++	return sum;
++}
++
++static bool apa_checksum_ok(const void *buf, sector_t sector)
++{
++	const __le32 *words = buf;
++	u32 checksum = le32_to_cpu(words[0]);
++
++	if (apa_sum(words, APA_HEADER_BYTES / 4) == checksum)
++		return true;
++	return sector == 0 && apa_sum(words, 512 / 4) == checksum;
++}
++
++/* Read the two sectors of the header at the sector into buf */
++static bool apa_read_header(struct parsed_partitions *state, sector_t sector,
++			    u8 *buf)
++{
++	Sector sect;
++	unsigned char *data;
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		data = read_part_sector(state, sector + i, &sect);
++		if (!data)
++			return false;
++		memcpy(buf + i * 512, data, 512);
++		put_dev_sector(sect);
++	}
++	return true;
++}
++
++static void apa_set_name(struct parsed_partitions *state, int slot,
++			 const char *id)
++{
++	struct partition_meta_info *info = &state->parts[slot].info;
++	size_t len = strnlen(id, APA_NAME_BYTES);
++
++	len = min(len, sizeof(info->volname) - 1);
++	memcpy(info->volname, id, len);
++	info->volname[len] = 0;
++	state->parts[slot].has_info = true;
++}
++
++int apa_partition(struct parsed_partitions *state)
++{
++	const sector_t capacity = get_capacity(state->bdev->bd_disk);
++	const struct apa_header *h;
++	sector_t sector = 0;
++	int slot = 1, count = 0;
++	u8 *buf;
++
++	buf = kmalloc(APA_HEADER_BYTES, GFP_KERNEL);
++	if (!buf)
++		return -1;
++	h = (const struct apa_header *)buf;
++
++	/* Sector 0: the header of __mbr, or the disk is not APA */
++	if (!apa_read_header(state, 0, buf) ||
++	    le32_to_cpu(h->magic) != APA_MAGIC ||
++	    memcmp(h->mbr_magic, apa_mbr_magic, sizeof(apa_mbr_magic) - 1) ||
++	    !apa_checksum_ok(buf, 0)) {
++		kfree(buf);
++		return 0;
++	}
++
++	for (;;) {
++		sector_t start = le32_to_cpu(h->start);
++		sector_t length = le32_to_cpu(h->length);
++		sector_t next = le32_to_cpu(h->next);
++
++		if (start != sector || length == 0 || start + length > capacity) {
++			pr_warn("%s: APA header at sector %llu is not valid\n",
++				state->name, (unsigned long long)sector);
++			break;
++		}
++
++		if (le16_to_cpu(h->type) != APA_TYPE_FREE &&
++		    le32_to_cpu(h->main) == 0 &&
++		    length > APA_RESERVED_SECTORS) {
++			if (slot >= state->limit)
++				break;
++			put_partition(state, slot, start + APA_RESERVED_SECTORS,
++				      length - APA_RESERVED_SECTORS);
++			apa_set_name(state, slot, h->id);
++			if (le32_to_cpu(h->nsub))
++				pr_info("%s: APA partition %.32s: only the main segment (%llu MiB) is in %s%d\n",
++					state->name, h->id,
++					(unsigned long long)(length >> 11),
++					state->name, slot);
++			slot++;
++		}
++
++		/* The last header points back to sector 0 */
++		if (next == 0)
++			break;
++		if (next <= sector || next >= capacity ||
++		    ++count >= APA_MAX_HEADERS) {
++			pr_warn("%s: APA ring broken after sector %llu\n",
++				state->name, (unsigned long long)sector);
++			break;
++		}
++		sector = next;
++		if (!apa_read_header(state, sector, buf) ||
++		    le32_to_cpu(h->magic) != APA_MAGIC ||
++		    !apa_checksum_ok(buf, sector)) {
++			pr_warn("%s: no valid APA header at sector %llu\n",
++				state->name, (unsigned long long)sector);
++			break;
++		}
++	}
++
++	strlcat(state->pp_buf, " [APA]\n", PAGE_SIZE);
++	kfree(buf);
++	return 1;
++}
+diff --git a/block/partitions/apa.h b/block/partitions/apa.h
+new file mode 100644
+index 000000000..0e14f2ba9
+--- /dev/null
++++ b/block/partitions/apa.h
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * APA, the partition format of the PlayStation 2 hard disk
++ */
++
++int apa_partition(struct parsed_partitions *state);
+diff --git a/block/partitions/check.c b/block/partitions/check.c
+index ffe408fea..27f55a078 100644
+--- a/block/partitions/check.c
++++ b/block/partitions/check.c
+@@ -36,6 +36,7 @@
+ #include "karma.h"
+ #include "sysv68.h"
+ #include "cmdline.h"
++#include "apa.h"
+ 
+ int warn_no_part = 1; /*This is ugly: should make genhd removable media aware*/
+ 
+@@ -70,6 +71,9 @@ static int (*check_part[])(struct parsed_partitions *) = {
+ #ifdef CONFIG_CMDLINE_PARTITION
+ 	cmdline_partition,
+ #endif
++#ifdef CONFIG_PS2_APA_PARTITION
++	apa_partition,		/* before efi and msdos: APA may carry a protective MBR */
++#endif
+ #ifdef CONFIG_EFI_PARTITION
+ 	efi_partition,		/* this must come before msdos */
+ #endif
+-- 
+2.43.0
+

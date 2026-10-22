@@ -1,0 +1,36 @@
+#!/bin/sh
+# Quake (QuakeSpasm) on the PlayStation 2, drawn by the GS and VU1 (OpenGL).
+# The game data: id1/pak0.pak (shareware), and pak1.pak for the full game,
+# in ~/games/quake, on the hard disk (/data) or on the FAT partition
+# (/boot), in that order. The game writes its settings next to the data.
+#
+# -heapsize: 12 MiB for the game, the console has 32 MiB. Two settings
+# make that enough. -zone 1024: the zone for strings and small objects is
+# 4 MiB in QuakeSpasm (512 KiB in the original game) and comes out of the
+# heap first. +max_edicts 1024: the default is 8192 entities, and each one
+# costs about 600 bytes of server memory outside the heap (5 MiB) and
+# 200 bytes of client memory in the heap (1.7 MiB). The original game
+# had 600, and the levels of the original episodes stay below that.
+# -width 320 -height 240: the GS scales the picture to the full screen.
+# -bpp 24 -refreshrate 50: the full screen mode as the SDL2 driver reports
+# it. The game accepts a mode only when all three numbers match.
+# -mixspeed 48000: the game mixes at the rate of the hardware, so ALSA
+# converts nothing. The default, 44100, costs a rate conversion on the EE.
+# The options of the command line come first: the game takes the first
+# -heapsize, so "quake -heapsize 12000" wins over the default below.
+GAMES="${HOME:-/home/root}/games"
+BASEDIR=""
+for d in "$GAMES/quake" /data /boot; do
+    if [ -f "$d/id1/pak0.pak" ] || [ -f "$d/id1/PAK0.PAK" ]; then
+        BASEDIR=$d
+        break
+    fi
+done
+if [ -z "$BASEDIR" ]; then
+    echo "quake: no id1/pak0.pak. Put it in $GAMES/quake/id1/" >&2
+    exit 1
+fi
+exec /usr/libexec/quakespasm/quakespasm +max_edicts 1024 "$@" \
+    -basedir "$BASEDIR" -heapsize 12000 -zone 1024 \
+    -width 320 -height 240 -bpp 24 -refreshrate 50 -fullscreen \
+    -mixspeed 48000 -nomtex -novbo

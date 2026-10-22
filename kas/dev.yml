@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+#
+# kas overlay: the USB drive image with a compiler and the headers, to
+# build programs on the console. Use it on top of ps2.yml:
+#
+#   kas build meta-playstation2/kas/ps2.yml:meta-playstation2/kas/dev.yml
+#
+# The image is build/tmp/deploy/images/ps2/ps2-image-dev-ps2.rootfs.wic.gz.
+# It needs a USB drive of at least 4 GB.
+
+header:
+  version: 14
+
+target: ps2-image-dev
